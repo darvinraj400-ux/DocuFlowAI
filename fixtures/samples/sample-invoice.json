@@ -1,0 +1,16 @@
+{
+  "description": "Synthetic sample invoice for demonstrations. Not a real document.",
+  "supplierName": "Acme Supplies Ltd",
+  "supplierTaxId": "GB123456789",
+  "invoiceNumber": "INV-2026-0001",
+  "invoiceDate": "2026-05-14",
+  "dueDate": "2026-06-13",
+  "currencyCode": "GBP",
+  "subtotal": "1000.00",
+  "taxTotal": "200.00",
+  "total": "1200.00",
+  "paymentTerms": "Net 30",
+  "lineItems": [
+    { "description": "Widget assembly service", "quantity": "10", "unitPrice": "100.00", "taxAmount": null, "lineTotal": "1000.00" }
+  ]
+}

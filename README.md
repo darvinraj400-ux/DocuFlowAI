@@ -12,26 +12,38 @@ the final call.
 Browser ──► Next.js 16 (App Router)
               │  ├─ /upload          (direct-to-Storage upload flow)
               │  ├─ /api/invoices/upload-intent
-              │  ├─ /api/invoices/:id/process   (secure processing)
-              │  └─ /invoices/:id    (review UI)
+              │  ├─ /api/invoices/:id/process   (auth + ownership; enqueues work)
+              │  ├─ /api/invoices/:id/status    (owner-scoped progress)
+              │  ├─ /api/inngest                (Inngest serve handler)
+              │  └─ /invoices/:id    (progress / review UI)
               │
+              ├─ Inngest durable `process-invoice` function
+              │    └─ one step per PDF page batch, DB checkpoints, fenced finalize
               ├─ Supabase Auth (SSR, PKCE)
               ├─ Supabase PostgreSQL + RLS
               ├─ Supabase Storage (private, owner-scoped signed URLs)
               └─ Extraction provider abstraction
                    ├─ Gemini (@google/genai, structured JSON)
+                   ├─ Groq (groq-sdk)
                    └─ Mock (deterministic, demo mode)
 ```
 
-The processing pipeline is modular and synchronous: authenticate → verify
-ownership → claim ` → download from private storage → validate file signature /
-size / page count → SHA-256 → duplicate checks → extract → normalize → validate →
-persist → `needs_review` (never auto-approve).
+The processing flow is durable: authenticate → verify ownership → enqueue a
+minimal `invoice/processing.requested` event (`invoiceId`, `ownerId`, `jobId`)
+→ return `202 queued` without changing the invoice status → the worker
+independently re-checks ownership, atomically claims the invoice, downloads and
+validates the private file, extracts each PDF page batch in its own
+`step.run()`, persists per-batch checkpoints in `extraction_meta`, merges
+deterministically, then performs a single fenced transition to `needs_review`
+(never auto-approve). Failures are recorded as `failed` with a retry path.
 
 ## What works (Phase 2)
 
 - Direct-to-Storage upload with server-validated upload-intent.
-- Secure processing endpoint (atomic claim, idempotent, rate-limited via DB).
+- Secure enqueue endpoint plus a durable Inngest worker (atomic claim, bounded
+  retries, per-invoice and per-user concurrency limits).
+- Per-batch checkpoints with resume, owner-scoped progress polling, and
+  deterministic merge.
 - Gemini extraction (structured output) with strict Zod validation + mock provider.
 - Deterministic monetary validation (decimal.js) and duplicate detection.
 - Invoice history, detail, and review UI (edit, save, approve, reject).
@@ -65,10 +77,13 @@ Copy `.env.example` → `.env.local`. Key variables:
 | `GROQ_MODEL` | Groq model (default `qwen/qwen3.8-27b`, multimodal) | No |
 | `MAX_PDF_PAGES` | PDF page limit (default 10) | No |
 | `MAX_CONCURRENT_PROCESSING` | Per-user processing cap (default 3) | No |
+| `INNGEST_DEV` | Force Inngest dev-server mode (`1`) or cloud mode (`0`) | No |
+| `INNGEST_EVENT_KEY` | Inngest Cloud event key | **No** |
+| `INNGEST_SIGNING_KEY` | Inngest Cloud signing key | **No** |
 | `NEXT_PUBLIC_SITE_URL` | Canonical origin for emails/redirects | Yes |
 
-Service-role and AI provider keys (Gemini, Groq) are never exposed via
-`NEXT_PUBLIC_*`.
+Service-role, AI provider, and Inngest keys are never exposed via
+`NEXT_PUBLIC_*`. In local development the Inngest Dev Server needs no keys.
 
 ## Setting up Supabase
 
@@ -123,6 +138,65 @@ pnpm dev
 
 Then open http://localhost:3000.
 
+## Durable processing with Inngest
+
+Processing runs in an Inngest function, so the app needs the Inngest Dev Server
+running alongside Next.js in local development. No Inngest keys are required
+locally.
+
+**Terminal 1 — Inngest Dev Server (PowerShell):**
+
+```powershell
+npx inngest-cli@latest dev -u http://localhost:3000/api/inngest
+```
+
+The Dev Server UI is at http://localhost:8288 and the app's serve endpoint is
+http://localhost:3000/api/inngest.
+
+**Terminal 2 — Next.js (PowerShell):**
+
+```powershell
+pnpm install   # first run only
+pnpm dev
+```
+
+Notes:
+
+- Set `AI_PROVIDER=mock` in `.env.local` for a fully offline end-to-end run.
+- With `INNGEST_DEV` unset, dev mode is inferred whenever `NODE_ENV` is not
+  `production`. Set `INNGEST_DEV=1` to force it, or `INNGEST_DEV=0` to force
+  cloud mode.
+- For Inngest Cloud, set `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY`
+  server-side and register `https://<your-app>/api/inngest` in the Inngest
+  dashboard. Never expose these keys to the browser.
+- The process route returns `503` with code `ENQUEUE_FAILED` when the event is
+  not accepted; the invoice stays retryable and is never reported as queued.
+
+Verify the integration:
+
+1. Open http://localhost:8288 — the app `docuflow-ai` and function
+   `process-invoice` should be registered.
+2. Upload a PDF or image and land on `/invoices/:id`; it shows **Queued**, then
+   **Processing**, and only shows review fields after the server persists
+   `needs_review`.
+3. In the Dev Server, the run for `invoice/processing.requested` shows
+   `claim-invoice`, `prepare-document`, one `extract-pages-<from>-<to>` step per
+   batch, and `finalize-invoice`.
+
+Batch and retry semantics:
+
+- PDFs over 3 pages with a page-ranged provider split into 3-page batches; each
+  batch is its own `step.run()` with a stable ID (`extract-pages-1-3`, …).
+  Images and providers without range support use one `extract-document` step.
+- Successful batches are checkpointed in `extraction_meta._batches`, keyed by
+  the file's SHA-256, and reused by retries or by a later job on the same file.
+- Transient provider failures (timeout, rate limit, outage) retry under the
+  function's bounded retry policy; permanent validation failures are persisted
+  and do not loop.
+- The final merge is deterministic and preserves conflicts, page evidence, and
+  coverage. A single fenced update transitions the invoice to `needs_review`;
+  stale or superseded jobs cannot overwrite a newer result.
+
 ## Demo mode (mock provider)
 
 Set `AI_PROVIDER=mock` to run the whole workflow with a deterministic provider
@@ -142,7 +216,12 @@ Test coverage includes: extraction schema parsing, missing fields, provider
 error handling, PDF/PNG/JPEG validation, oversized/invalid files, PDF page
 limits, decimal arithmetic/tolerance, duplicate file & supplier/number
 detection, status transitions, concurrent claims, ownership checks, save /
-approve / reject validation, dashboard metrics and empty states.
+approve / reject validation, dashboard metrics and empty states, plus durable
+processing: event validation, enqueue success/failure, owner-scoped status
+refresh and polling termination, per-batch retry/resume from checkpoints,
+page-number preservation and coverage grounding, exactly-once finalization,
+partial/terminal failures, and superseded-job fencing. Inngest and AI providers
+are mocked; no live calls are needed.
 
 Live RLS integration tests (`tests/integration/rls.test.ts`) are gated on real
 Supabase test credentials and skipped otherwise.
@@ -153,7 +232,8 @@ Supabase test credentials and skipped otherwise.
 2. Start the app and register/sign in.
 3. Go to `/upload` and upload a small PDF/JPEG/PNG (≤5 MB, ≤10 pages).
 4. The file is validated client + server side, uploaded to private storage, and
-   processed. On success it lands in `/invoices/:id` as `needs_review`.
+   queued. With both servers running, the Inngest worker extracts it and the
+   detail page refreshes when it lands in `/invoices/:id` as `needs_review`.
 5. Review: inspect the original document, edit fields, save corrections, then
    approve or reject. Approvals are blocked while error-level validation issues
    remain, and the original extraction is preserved separately from reviewed
@@ -216,9 +296,13 @@ supported model — the code does not silently pick another model.
 
 ## Known limitations & demo mode
 
-- Processing is synchronous and bounded (`maxDuration` 60s on Vercel); very
-  large documents may exceed the limit. Processing is rate-limited per user via
-  the database (max concurrent), not an in-memory limiter.
+- Processing requires Inngest. Locally that means the Dev Server must be
+  running; without it enqueue returns `503 ENQUEUE_FAILED` and the invoice is
+  left retryable — it is never reported as completed. Production needs Inngest
+  Cloud or a self-hosted Inngest server.
+- PDFs are extracted in 3-page batches (one durable step each) and bounded by
+  `MAX_PDF_PAGES` (default 10); `MAX_CONCURRENT_PROCESSING` caps concurrent
+  jobs per user in both the UI and the Inngest function.
 - Only PDF, JPEG, and PNG are accepted; PDF page limit is configurable.
 - Gemini extraction quality depends on the model; validation never trusts model
   confidence scores.
@@ -230,24 +314,29 @@ supported model — the code does not silently pick another model.
 1. Import the repo into Vercel.
 2. Add environment variables for each scope.
    - **Production**: the real Supabase URL/publishable key, service-role key,
-     Gemini key, `NEXT_PUBLIC_SITE_URL`, model/page-limit settings. Never set
-     `AI_PROVIDER=mock` here (mock is for local/demo only).
+     Gemini key, `NEXT_PUBLIC_SITE_URL`, model/page-limit settings, plus
+     `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` (or point at a self-hosted
+     Inngest server). Never set `AI_PROVIDER=mock` here (mock is for
+     local/demo only).
    - **Preview**: a separate Supabase Preview/Test project if you want isolated
      data; otherwise the same variables (or a staging project).
    - **Development**: local `.env.local` values.
-3. Deploy. Check `https://<app>.vercel.app/api/health` — the `readiness`
+3. Register `https://<app>.vercel.app/api/inngest` with Inngest and confirm the
+   `process-invoice` function syncs.
+4. Deploy. Check `https://<app>.vercel.app/api/health` — the `readiness`
    block reports `supabaseConfigured`, `serverCredentialsConfigured`, and
    `extractionProvider` without exposing secrets.
-4. Update Supabase Authentication → URL Configuration Site URL / redirect URLs
+5. Update Supabase Authentication → URL Configuration Site URL / redirect URLs
    to each environment origin (e.g. `https://<app>.vercel.app/**` and
    `http://localhost:3000/**`).
 
 ### Vercel function runtime
 
-The processing endpoint declares `maxDuration = 60` (Node runtime). On Vercel:
-enable Fluid compute (or a plan that allows ≥ 60s) for that route; otherwise the
-function may be terminated for long documents. Processing is synchronous and
-bounded by direct, 5 MB, and 10-page limits (all configurable).
+The Inngest route (`/api/inngest`) declares `maxDuration = 300`; it serves the
+durable worker and each page batch is a separate step. On Vercel, use a plan
+that allows that duration. The enqueue route is short-lived (`maxDuration = 15`)
+and returns as soon as Inngest accepts the event. Uploads remain bounded by the
+5 MB and `MAX_PDF_PAGES` limits.
 
 ## Roadmap
 

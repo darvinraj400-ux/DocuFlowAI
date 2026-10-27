@@ -5,8 +5,10 @@ import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createSignedViewUrl, assertOwnedStoragePath, INVOICE_BUCKET } from "@/lib/storage";
 import { ReviewForm } from "@/components/invoices/review-form";
+import { ProcessingStatus } from "@/components/invoices/processing-status";
 import { ExtractionInventory } from "@/components/invoices/extraction-inventory";
 import { mergeExtractionForReview } from "@/lib/review/merge";
+import { buildInvoiceProgress } from "@/lib/invoice-progress";
 import type { ValidationFinding, DuplicateFlags, InvoiceStatus } from "@/types/invoice";
 import type { ExtractionResult } from "@/lib/pipeline/schema";
 
@@ -75,15 +77,16 @@ export default async function InvoiceDetailPage({
   const duplicateFlags = (invoice.duplicate_flags ?? null) as DuplicateFlags | null;
   const meta = (invoice.extraction_meta ?? {}) as Record<string, unknown>;
   const demo = meta.demo === true;
+  const status = invoice.status as InvoiceStatus;
+  const reviewable = status === "needs_review" || status === "approved" || status === "rejected";
+  const title = reviewable ? "Review invoice" : status === "failed" ? "Processing failed" : "Processing invoice";
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Review invoice
-        </h1>
+        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
         <p className="text-sm text-muted-foreground">
-          {invoice.original_filename} · {(invoice.status as InvoiceStatus).replace("_", " ")}
+          {invoice.original_filename} · {status.replace("_", " ")}
         </p>
       </div>
 
@@ -112,14 +115,27 @@ export default async function InvoiceDetailPage({
             </dl>
           </div>
 
-          <ReviewForm
-            invoiceId={id}
-            initial={initial}
-            findings={findings}
-            duplicateFlags={duplicateFlags}
-            demo={demo}
-            status={invoice.status as InvoiceStatus}
-          />
+          {reviewable ? (
+            <ReviewForm
+              invoiceId={id}
+              initial={initial}
+              findings={findings}
+              duplicateFlags={duplicateFlags}
+              demo={demo}
+              status={status}
+            />
+          ) : (
+            <ProcessingStatus
+              invoiceId={id}
+              initial={buildInvoiceProgress({
+                id: invoice.id,
+                status,
+                updated_at: invoice.updated_at,
+                extraction_meta: invoice.extraction_meta,
+                error_info: invoice.error_info,
+              })}
+            />
+          )}
 
           {events && events.length > 0 && (
             <div className="rounded-xl border border-border p-4 text-sm">

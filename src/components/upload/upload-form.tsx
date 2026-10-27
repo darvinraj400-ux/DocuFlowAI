@@ -11,7 +11,7 @@ const MAX_SIZE = 5 * 1024 * 1024;
 const ALLOWED_EXT = ["pdf", "jpg", "jpeg", "png"];
 const ALLOWED_MIME = ["application/pdf", "image/jpeg", "image/png"];
 
-type Step = "idle" | "reserving" | "uploading" | "processing" | "done";
+type Step = "idle" | "reserving" | "uploading" | "queued" | "done";
 
 function extOf(name: string): string {
   const i = name.lastIndexOf(".");
@@ -48,6 +48,7 @@ export function UploadForm() {
 
     // TEMP DIAG: track which step throws so the failing stage is identifiable.
     let stage = "reserve";
+    let reservedId: string | null = null;
     try {
       const reserve = await fetch("/api/invoices/upload-intent", {
         method: "POST",
@@ -66,6 +67,7 @@ export function UploadForm() {
       }
 
       const { invoiceId: id, storagePath } = reserveBody;
+      reservedId = id;
       setInvoiceId(id);
 
       setStep("uploading");
@@ -81,10 +83,10 @@ export function UploadForm() {
         return;
       }
 
-      setStep("processing");
-      stage = "process";
+      setStep("queued");
+      stage = "enqueue";
       const processRes = await fetch(`/api/invoices/${id}/process`, { method: "POST" });
-      const processBody = await processRes.json();
+      const processBody = await processRes.json().catch(() => ({} as { error?: string }));
 
       if (!processRes.ok) {
         // TEMP DIAG: pathname and status only — never the full URL, headers,
@@ -97,11 +99,16 @@ export function UploadForm() {
         } catch {
           console.error("[upload-diag] processResponse", { status: processRes.status });
         }
-        setError(processBody.error ?? "Processing failed. The invoice was marked as failed and can be retried.");
+        setError(
+          processBody.error ??
+            "Processing could not be queued. The invoice was not queued; please retry.",
+        );
         setStep("idle");
         return;
       }
 
+      // Enqueued, not finished. The invoice page shows live queued/processing
+      // progress until the worker persists a reviewable extraction.
       setStep("done");
       router.push(`/invoices/${id}`);
       router.refresh();
@@ -112,16 +119,17 @@ export function UploadForm() {
       setStep("idle");
       // If a record was already reserved, do not leave an orphaned "uploaded"
       // row behind: mark it failed through the authorized server route.
-      if (invoiceId) {
-        void markFailed();
+      if (reservedId) {
+        void markFailed(reservedId);
       }
     }
   }
 
-  async function markFailed() {
-    if (!invoiceId) return;
+  async function markFailed(idArg?: string) {
+    const target = idArg ?? invoiceId;
+    if (!target) return;
     try {
-      await fetch(`/api/invoices/${invoiceId}/fail`, { method: "POST" });
+      await fetch(`/api/invoices/${target}/fail`, { method: "POST" });
     } finally {
       setFile(null);
       setInvoiceId(null);
@@ -130,7 +138,7 @@ export function UploadForm() {
     }
   }
 
-  const busy = step === "reserving" || step === "uploading" || step === "processing";
+  const busy = step === "reserving" || step === "uploading" || step === "queued";
 
   return (
     <div className="space-y-6">
@@ -141,7 +149,7 @@ export function UploadForm() {
           <AlertDescription>{error}</AlertDescription>
           {invoiceId && (
             <div className="mt-2">
-              <Button type="button" variant="outline" size="sm" onClick={markFailed}>
+              <Button type="button" variant="outline" size="sm" onClick={() => markFailed()}>
                 Mark this upload as failed
               </Button>
             </div>
@@ -199,11 +207,11 @@ export function UploadForm() {
                 <Loader2 className="size-4 animate-spin" aria-hidden="true" />
                 {step === "reserving" && "Reserving upload…"}
                 {step === "uploading" && "Uploading to secure storage…"}
-                {step === "processing" && "Processing with AI…"}
+                {step === "queued" && "Queuing processing…"}
               </span>
             ) : (
               <Button type="button" onClick={runUpload}>
-                Upload & process
+                Upload &amp; queue processing
               </Button>
             )}
             {!busy && (

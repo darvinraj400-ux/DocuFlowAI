@@ -5,6 +5,8 @@ describe("route guard", () => {
   it("classifies protected, guest, and public routes", () => {
     expect(resolveRouteKind("/dashboard")).toBe("protected");
     expect(resolveRouteKind("/dashboard/invoices")).toBe("protected");
+    expect(resolveRouteKind("/settings")).toBe("protected");
+    expect(resolveRouteKind("/settings/security")).toBe("protected");
     expect(resolveRouteKind("/login")).toBe("guest");
     expect(resolveRouteKind("/register")).toBe("guest");
     expect(resolveRouteKind("/forgot-password")).toBe("guest");

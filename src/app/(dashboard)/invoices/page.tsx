@@ -4,8 +4,17 @@ import { redirect } from "next/navigation";
 import { connection } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import type { InvoiceStatus } from "@/types/invoice";
+import {
+  INVOICE_PAGE_SIZE,
+  MAX_INVOICE_SEARCH_LENGTH,
+  buildInvoiceSearchFilter,
+  buildInvoicesHref,
+  parseInvoiceListFilters,
+} from "@/lib/invoices/filters";
 import { buttonVariants } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 export const metadata: Metadata = {
   title: "Invoices · DocuFlow AI",
@@ -16,9 +25,7 @@ export const metadata: Metadata = {
 // Navigation validation for this segment.
 export const instant = false;
 
-const PAGE_SIZE = 10;
-
-const STATUS_FILTERS: Array<{ value: string; label: string }> = [
+const STATUS_FILTERS: Array<{ value: InvoiceStatus | ""; label: string }> = [
   { value: "", label: "All" },
   { value: "needs_review", label: "Needs review" },
   { value: "approved", label: "Approved" },
@@ -35,10 +42,11 @@ function displayField(data: Record<string, unknown> | null, key: string): string
 export default async function InvoicesPage({
   searchParams,
 }: {
-  searchParams: Promise<{ status?: string; page?: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const { status = "", page = "1" } = await searchParams;
-  const currentPage = Math.max(1, Number.parseInt(page, 10) || 1);
+  const rawParams = await searchParams;
+  const filters = parseInvoiceListFilters(rawParams);
+  const offset = (filters.page - 1) * INVOICE_PAGE_SIZE;
 
   // This authenticated page serves user-specific data and must render at
   // request time — never as a cached static shell. Opt in to request-time
@@ -56,11 +64,20 @@ export default async function InvoicesPage({
   const { data: { user }, error: authError } = await supabase.auth.getUser();
   if (authError || !user) redirect("/login");
 
-  const offset = (currentPage - 1) * PAGE_SIZE;
-
-  let query = supabase.from("invoices").select("id,status,created_at,original_filename,extracted_data,reviewed_data", { count: "exact" });
-  if (status) query = query.eq("status", status);
-  query = query.order("created_at", { ascending: false }).range(offset, offset + PAGE_SIZE - 1);
+  let query = supabase
+    .from("invoices")
+    .select(
+      "id,status,created_at,original_filename,extracted_data,reviewed_data",
+      { count: "exact" },
+    )
+    .eq("user_id", user.id);
+  if (filters.status) query = query.eq("status", filters.status);
+  const searchFilter = buildInvoiceSearchFilter(filters.q);
+  if (searchFilter) query = query.or(searchFilter);
+  query = query
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: true })
+    .range(offset, offset + INVOICE_PAGE_SIZE - 1);
 
   const { data, count, error } = await query;
   if (error) return <DbError />;
@@ -74,8 +91,12 @@ export default async function InvoicesPage({
     reviewed_data: Record<string, unknown> | null;
   }>;
 
-  const totalPages = Math.max(1, Math.ceil((count ?? 0) / PAGE_SIZE));
-  const visible = invoices.slice(0, PAGE_SIZE);
+  const total = count ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / INVOICE_PAGE_SIZE));
+  const displayPage = Math.min(filters.page, totalPages);
+  const previousPage = filters.page > 1 ? Math.min(filters.page - 1, totalPages) : null;
+  const nextPage = filters.page < totalPages ? filters.page + 1 : null;
+  const outOfRange = invoices.length === 0 && total > 0 && filters.page > totalPages;
 
   return (
     <div className="space-y-6">
@@ -87,14 +108,56 @@ export default async function InvoicesPage({
         <Link href="/upload" className={buttonVariants()}>Upload invoice</Link>
       </div>
 
+      <form method="get" action="/invoices" role="search" className="flex flex-wrap items-end gap-2">
+        {filters.status && <input type="hidden" name="status" value={filters.status} />}
+        <div className="min-w-[16rem] flex-1">
+          <Label htmlFor="invoice-search" className="text-xs text-muted-foreground">
+            Search invoices
+          </Label>
+          <Input
+            id="invoice-search"
+            name="q"
+            type="search"
+            defaultValue={filters.q}
+            maxLength={MAX_INVOICE_SEARCH_LENGTH}
+            placeholder="Invoice number, supplier, or file name"
+            className="mt-1.5"
+          />
+        </div>
+        <button type="submit" className={buttonVariants({ variant: "secondary" })}>
+          Search
+        </button>
+        {(filters.q || filters.status) && (
+          <Link href={buildInvoicesHref({})} className={buttonVariants({ variant: "ghost" })}>
+            Clear filters
+          </Link>
+        )}
+      </form>
+
+      {filters.ignoredStatus && (
+        <Alert variant="info">
+          <AlertTitle>Unknown status filter</AlertTitle>
+          <AlertDescription>
+            The status &ldquo;{filters.ignoredStatus}&rdquo; is not recognised, so it was ignored.
+          </AlertDescription>
+        </Alert>
+      )}
+      {filters.invalidPage && (
+        <Alert variant="info">
+          <AlertTitle>Invalid page</AlertTitle>
+          <AlertDescription>
+            The requested page was not valid, so the first page is shown.
+          </AlertDescription>
+        </Alert>
+      )}
+
       <div className="flex flex-wrap gap-2">
         {STATUS_FILTERS.map((filter) => {
-          const active = status === filter.value;
-          const href = filter.value ? `?status=${filter.value}` : "/invoices";
+          const active = filters.status === filter.value;
           return (
             <Link
               key={filter.value}
-              href={href}
+              href={buildInvoicesHref({ status: filter.value, q: filters.q })}
               className={buttonVariants({ variant: active ? "default" : "outline", size: "sm" })}
             >
               {filter.label}
@@ -103,11 +166,29 @@ export default async function InvoicesPage({
         })}
       </div>
 
-      {visible.length === 0 ? (
+      {outOfRange ? (
         <Alert variant="info">
-          <AlertTitle>No invoices</AlertTitle>
+          <AlertTitle>Page out of range</AlertTitle>
           <AlertDescription>
-            {status ? `No invoices match the "${status}" filter.` : "You have not uploaded any invoices yet."}
+            There are only {totalPages} page{totalPages === 1 ? "" : "s"} of results.{" "}
+            <Link
+              href={buildInvoicesHref({ status: filters.status, q: filters.q })}
+              className="underline"
+            >
+              Go to the first page
+            </Link>
+            .
+          </AlertDescription>
+        </Alert>
+      ) : invoices.length === 0 ? (
+        <Alert variant="info">
+          <AlertTitle>{filters.q ? "No matching invoices" : "No invoices"}</AlertTitle>
+          <AlertDescription>
+            {filters.q
+              ? `No invoices match “${filters.q}”${filters.status ? ` with the "${filters.status}" status` : ""}.`
+              : filters.status
+                ? `No invoices match the "${filters.status}" filter.`
+                : "You have not uploaded any invoices yet."}
           </AlertDescription>
         </Alert>
       ) : (
@@ -123,10 +204,10 @@ export default async function InvoicesPage({
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {visible.map((inv) => {
+              {invoices.map((inv) => {
                 const data = inv.reviewed_data ?? inv.extracted_data;
                 const currency = displayField(data, "currencyCode");
-                const total = displayField(data, "total");
+                const totalValue = displayField(data, "total");
                 return (
                   <tr key={inv.id} className="hover:bg-muted/30">
                     <td className="px-4 py-3">
@@ -136,7 +217,7 @@ export default async function InvoicesPage({
                     </td>
                     <td className="px-4 py-3">{displayField(data, "supplierName")}</td>
                     <td className="px-4 py-3">{displayField(data, "invoiceDate")}</td>
-                    <td className="px-4 py-3">{currency !== "—" ? `${currency} ${total}` : total}</td>
+                    <td className="px-4 py-3">{currency !== "—" ? `${currency} ${totalValue}` : totalValue}</td>
                     <td className="px-4 py-3">
                       <span className="rounded-full border border-border px-2 py-0.5 text-xs">{inv.status.replace("_", " ")}</span>
                     </td>
@@ -150,16 +231,24 @@ export default async function InvoicesPage({
 
       {totalPages > 1 && (
         <div className="flex items-center justify-between">
-          {currentPage > 1 ? (
-            <Link className={buttonVariants({ variant: "outline", size: "sm" })} href={`?${status ? `status=${status}&` : ""}page=${currentPage - 1}`}>
+          {previousPage ? (
+            <Link
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+              href={buildInvoicesHref({ status: filters.status, q: filters.q, page: previousPage })}
+            >
               Previous
             </Link>
           ) : (
             <span />
           )}
-          <span className="text-sm text-muted-foreground">Page {currentPage} of {totalPages}</span>
-          {currentPage < totalPages ? (
-            <Link className={buttonVariants({ variant: "outline", size: "sm" })} href={`?${status ? `status=${status}&` : ""}page=${currentPage + 1}`}>
+          <span className="text-sm text-muted-foreground">
+            Page {displayPage} of {totalPages}
+          </span>
+          {nextPage ? (
+            <Link
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+              href={buildInvoicesHref({ status: filters.status, q: filters.q, page: nextPage })}
+            >
               Next
             </Link>
           ) : (

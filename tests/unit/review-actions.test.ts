@@ -130,4 +130,52 @@ describe("review actions preserve effective data", () => {
     const res = await approveAction(INVOICE_ID, {}, makeForm({ total: "" }));
     expect(res.global).toContain("MISSING_TOTAL");
   });
+
+  it("persists added and edited line items in reviewed_data only", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "Extracted item", productCode: "SKU-0", quantity: "1", unitPrice: "5.00", lineTotal: "5.00" },
+    ];
+    const { updates } = setupAdmin(row);
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_description: "Edited item",
+        li_0_productCode: "SKU-0",
+        li_0_quantity: "1",
+        li_0_unitPrice: "5.00",
+        li_0_lineTotal: "5.00",
+        li_1_description: "Added item",
+        li_1_quantity: "2",
+        li_1_unitPrice: "3.50",
+        li_1_lineTotal: "7.00",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    expect(updates).toHaveLength(1);
+    const payload = updates[0]! as Record<string, unknown>;
+    expect(payload.extracted_data).toBeUndefined();
+    const lines = (payload.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({ description: "Edited item", productCode: "SKU-0" });
+    expect(lines[1]).toMatchObject({ description: "Added item", lineTotal: "7.00" });
+  });
+
+  it("approve blocks invalid line-item money in the edited data", async () => {
+    const { updates } = setupAdmin(extractedRow());
+    const res = await approveAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_description: "Widget",
+        li_0_quantity: "-1",
+        li_0_unitPrice: "5.00",
+        li_0_lineTotal: "-5.00",
+      }),
+    );
+    expect(res.global).toContain("NEGATIVE_AMOUNT");
+    expect(updates).toHaveLength(0);
+  });
 });

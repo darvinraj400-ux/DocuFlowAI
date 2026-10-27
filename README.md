@@ -15,7 +15,9 @@ Browser ──► Next.js 16 (App Router)
               │  ├─ /api/invoices/:id/process   (auth + ownership; enqueues work)
               │  ├─ /api/invoices/:id/status    (owner-scoped progress)
               │  ├─ /api/inngest                (Inngest serve handler)
-              │  └─ /invoices/:id    (progress / review UI)
+              │  ├─ /invoices        (search, status filter, pagination)
+              │  ├─ /invoices/:id    (progress / review UI)
+              │  └─ /settings        (account + read-only processing config)
               │
               ├─ Inngest durable `process-invoice` function
               │    └─ one step per PDF page batch, DB checkpoints, fenced finalize
@@ -37,7 +39,7 @@ validates the private file, extracts each PDF page batch in its own
 deterministically, then performs a single fenced transition to `needs_review`
 (never auto-approve). Failures are recorded as `failed` with a retry path.
 
-## What works (Phase 2)
+## What works (Phases 1–3)
 
 - Direct-to-Storage upload with server-validated upload-intent.
 - Secure enqueue endpoint plus a durable Inngest worker (atomic claim, bounded
@@ -47,6 +49,12 @@ deterministically, then performs a single fenced transition to `needs_review`
 - Gemini extraction (structured output) with strict Zod validation + mock provider.
 - Deterministic monetary validation (decimal.js) and duplicate detection.
 - Invoice history, detail, and review UI (edit, save, approve, reject).
+- Invoice search by number, supplier, or filename with validated status/page
+  filters and deterministic pagination.
+- Settings for the signed-in account (email, password change) plus a read-only
+  view of processing configuration — no secrets are exposed.
+- Line-item add/edit/remove in review, with decimal validation and preservation
+  of extraction-only line fields; edits are stored as `reviewed_data`.
 - Real dashboard metrics from the database (honest empty states).
 
 ## Stack
@@ -343,6 +351,6 @@ and returns as soon as Inngest accepts the event. Uploads remain bounded by the
 - Phase 0 — foundation (done).
 - Phase 1 — authentication + dashboard shell (done).
 - Phase 2 — upload, processing pipeline, validation, review (done).
-- Phase 3 — search, settings, better line-item editing.
+- Phase 3 — search, settings, better line-item editing (done).
 - Phase 4 — deeper AI evaluation and extraction-accuracy reporting.
 - Phase 5 — optional n8n webhook integration (disabled by default).

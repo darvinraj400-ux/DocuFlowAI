@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -10,8 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import type { ExtractionResult, LineItem } from "@/lib/pipeline/schema";
 import type { ValidationFinding, DuplicateFlags } from "@/types/invoice";
 import { approveAction, rejectAction, saveCorrectionsAction, type ReviewFormState } from "@/lib/review/actions";
-
-const EMPTY_LINE: LineItem = { description: "", quantity: "", unitPrice: "", taxAmount: "", lineTotal: "" };
+import { EMPTY_LINE, buildReviewFormData } from "@/lib/review/form-fields";
 
 function formatPartyAddress(address: unknown): string {
   if (typeof address === "string") return address;
@@ -44,29 +43,6 @@ function toValue(initial: Partial<ExtractionResult> | null): ExtractionResult {
   };
 }
 
-function buildFormData(v: ExtractionResult): FormData {
-  const fd = new FormData();
-  const set = (key: string, val: string | null | undefined) => fd.set(key, val == null ? "" : String(val));
-  set("supplierName", v.supplierName);
-  set("supplierTaxId", v.supplierTaxId);
-  set("invoiceNumber", v.invoiceNumber);
-  set("invoiceDate", v.invoiceDate);
-  set("dueDate", v.dueDate);
-  set("currencyCode", v.currencyCode);
-  set("subtotal", v.subtotal);
-  set("taxTotal", v.taxTotal);
-  set("total", v.total);
-  set("paymentTerms", v.paymentTerms);
-  (v.lineItems ?? []).forEach((line, i) => {
-    set(`li_${i}_description`, line.description);
-    set(`li_${i}_quantity`, line.quantity);
-    set(`li_${i}_unitPrice`, line.unitPrice);
-    set(`li_${i}_taxAmount`, line.taxAmount);
-    set(`li_${i}_lineTotal`, line.lineTotal);
-  });
-  return fd;
-}
-
 export function ReviewForm(props: {
   invoiceId: string;
   initial: Partial<ExtractionResult> | null;
@@ -77,26 +53,46 @@ export function ReviewForm(props: {
 }) {
   const [value, setValue] = useState(() => toValue(props.initial));
   const [global, setGlobal] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [note, setNote] = useState("");
   const [isPending, startTransition] = useTransition();
+  const canReview = props.status === "needs_review";
 
-  const set = (key: keyof ExtractionResult, val: string) => setValue((v) => ({ ...v, [key]: val }));
-  const setLine = (index: number, key: keyof LineItem, val: string) =>
+  const set = (key: keyof ExtractionResult, val: string) => {
+    setMessage(null);
+    setValue((v) => ({ ...v, [key]: val }));
+  };
+  const setLine = (index: number, key: keyof LineItem, val: string) => {
+    setMessage(null);
     setValue((v) => ({
       ...v,
       lineItems: (v.lineItems ?? []).map((line, i) => (i === index ? { ...line, [key]: val } : line)),
     }));
+  };
+  const addLine = () => {
+    setMessage(null);
+    setValue((v) => ({ ...v, lineItems: [...(v.lineItems ?? []), { ...EMPTY_LINE }] }));
+  };
+  const removeLine = (index: number) => {
+    setMessage(null);
+    setValue((v) => ({
+      ...v,
+      lineItems: (v.lineItems ?? []).filter((_, i) => i !== index),
+    }));
+  };
 
   function run(action: typeof approveAction) {
     setGlobal(null);
+    setMessage(null);
     setFieldErrors({});
-    const fd = buildFormData(value);
+    const fd = buildReviewFormData(value);
     startTransition(async () => {
       try {
         const state: ReviewFormState = await action(props.invoiceId, {}, fd);
         if (state?.errors) setFieldErrors(state.errors);
         if (state?.global) setGlobal(state.global);
+        if (state?.success && state.message) setMessage(state.message);
       } catch {
         // Successful actions redirect; ignore the redirect signal.
       }
@@ -112,6 +108,21 @@ export function ReviewForm(props: {
         <Alert variant="destructive">
           <AlertTitle>Action failed</AlertTitle>
           <AlertDescription>{global}</AlertDescription>
+        </Alert>
+      )}
+
+      {message && (
+        <Alert variant="success">
+          <AlertTitle>Saved</AlertTitle>
+          <AlertDescription>{message}</AlertDescription>
+        </Alert>
+      )}
+
+      {!canReview && (
+        <Alert variant="info">
+          <AlertDescription>
+            This invoice is {props.status.replace("_", " ")} and is read-only.
+          </AlertDescription>
         </Alert>
       )}
 
@@ -140,24 +151,24 @@ export function ReviewForm(props: {
 
       <form onSubmit={(e) => e.preventDefault()} className="space-y-6">
         <div className="grid gap-4 sm:grid-cols-2">
-          <div><Label htmlFor="supplierName">Supplier</Label><Input id="supplierName" value={value.supplierName ?? ""} onChange={(e) => set("supplierName", e.target.value)} className={inputCls} />{fieldError("supplierName")}</div>
-          <div><Label htmlFor="supplierTaxId">Tax ID</Label><Input id="supplierTaxId" value={value.supplierTaxId ?? ""} onChange={(e) => set("supplierTaxId", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="invoiceNumber">Invoice number</Label><Input id="invoiceNumber" value={value.invoiceNumber ?? ""} onChange={(e) => set("invoiceNumber", e.target.value)} className={inputCls} />{fieldError("invoiceNumber")}</div>
-          <div><Label htmlFor="invoiceDate">Invoice date</Label><Input id="invoiceDate" value={value.invoiceDate ?? ""} onChange={(e) => set("invoiceDate", e.target.value)} className={inputCls} />{fieldError("invoiceDate")}</div>
-          <div><Label htmlFor="dueDate">Due date</Label><Input id="dueDate" value={value.dueDate ?? ""} onChange={(e) => set("dueDate", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="currencyCode">Currency</Label><Input id="currencyCode" value={value.currencyCode ?? ""} onChange={(e) => set("currencyCode", e.target.value)} className={inputCls} />{fieldError("currencyCode")}</div>
-          <div><Label htmlFor="subtotal">Subtotal</Label><Input id="subtotal" value={value.subtotal ?? ""} onChange={(e) => set("subtotal", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="taxTotal">Tax total</Label><Input id="taxTotal" value={value.taxTotal ?? ""} onChange={(e) => set("taxTotal", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="total">Total</Label><Input id="total" value={value.total ?? ""} onChange={(e) => set("total", e.target.value)} className={inputCls} />{fieldError("total")}</div>
-          <div><Label htmlFor="paymentTerms">Payment terms</Label><Input id="paymentTerms" value={value.paymentTerms ?? ""} onChange={(e) => set("paymentTerms", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="documentType">Document type</Label><Input id="documentType" value={value.documentType ?? ""} onChange={(e) => set("documentType", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="orderNumber">Order / PO number</Label><Input id="orderNumber" value={value.orderNumber ?? ""} onChange={(e) => set("orderNumber", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="buyerName">Buyer / customer</Label><Input id="buyerName" value={value.buyerName ?? ""} onChange={(e) => set("buyerName", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="buyerTaxId">Buyer tax ID</Label><Input id="buyerTaxId" value={value.buyerTaxId ?? ""} onChange={(e) => set("buyerTaxId", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="shippingCost">Shipping</Label><Input id="shippingCost" value={value.shippingCost ?? ""} onChange={(e) => set("shippingCost", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="amountPaid">Amount paid</Label><Input id="amountPaid" value={value.amountPaid ?? ""} onChange={(e) => set("amountPaid", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="balanceDue">Balance due</Label><Input id="balanceDue" value={value.balanceDue ?? ""} onChange={(e) => set("balanceDue", e.target.value)} className={inputCls} /></div>
-          <div><Label htmlFor="amountDiscounted">Discount</Label><Input id="amountDiscounted" value={value.amountDiscounted ?? ""} onChange={(e) => set("amountDiscounted", e.target.value)} className={inputCls} /></div>
+          <div><Label htmlFor="supplierName">Supplier</Label><Input id="supplierName" value={value.supplierName ?? ""} onChange={(e) => set("supplierName", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("supplierName")}</div>
+          <div><Label htmlFor="supplierTaxId">Tax ID</Label><Input id="supplierTaxId" value={value.supplierTaxId ?? ""} onChange={(e) => set("supplierTaxId", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="invoiceNumber">Invoice number</Label><Input id="invoiceNumber" value={value.invoiceNumber ?? ""} onChange={(e) => set("invoiceNumber", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("invoiceNumber")}</div>
+          <div><Label htmlFor="invoiceDate">Invoice date</Label><Input id="invoiceDate" value={value.invoiceDate ?? ""} onChange={(e) => set("invoiceDate", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("invoiceDate")}</div>
+          <div><Label htmlFor="dueDate">Due date</Label><Input id="dueDate" value={value.dueDate ?? ""} onChange={(e) => set("dueDate", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="currencyCode">Currency</Label><Input id="currencyCode" value={value.currencyCode ?? ""} onChange={(e) => set("currencyCode", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("currencyCode")}</div>
+          <div><Label htmlFor="subtotal">Subtotal</Label><Input id="subtotal" inputMode="decimal" value={value.subtotal ?? ""} onChange={(e) => set("subtotal", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("subtotal")}</div>
+          <div><Label htmlFor="taxTotal">Tax total</Label><Input id="taxTotal" inputMode="decimal" value={value.taxTotal ?? ""} onChange={(e) => set("taxTotal", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("taxTotal")}</div>
+          <div><Label htmlFor="total">Total</Label><Input id="total" inputMode="decimal" value={value.total ?? ""} onChange={(e) => set("total", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("total")}</div>
+          <div><Label htmlFor="paymentTerms">Payment terms</Label><Input id="paymentTerms" value={value.paymentTerms ?? ""} onChange={(e) => set("paymentTerms", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="documentType">Document type</Label><Input id="documentType" value={value.documentType ?? ""} onChange={(e) => set("documentType", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="orderNumber">Order / PO number</Label><Input id="orderNumber" value={value.orderNumber ?? ""} onChange={(e) => set("orderNumber", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="buyerName">Buyer / customer</Label><Input id="buyerName" value={value.buyerName ?? ""} onChange={(e) => set("buyerName", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="buyerTaxId">Buyer tax ID</Label><Input id="buyerTaxId" value={value.buyerTaxId ?? ""} onChange={(e) => set("buyerTaxId", e.target.value)} disabled={!canReview} className={inputCls} /></div>
+          <div><Label htmlFor="shippingCost">Shipping</Label><Input id="shippingCost" inputMode="decimal" value={value.shippingCost ?? ""} onChange={(e) => set("shippingCost", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("shippingCost")}</div>
+          <div><Label htmlFor="amountPaid">Amount paid</Label><Input id="amountPaid" inputMode="decimal" value={value.amountPaid ?? ""} onChange={(e) => set("amountPaid", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("amountPaid")}</div>
+          <div><Label htmlFor="balanceDue">Balance due</Label><Input id="balanceDue" inputMode="decimal" value={value.balanceDue ?? ""} onChange={(e) => set("balanceDue", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("balanceDue")}</div>
+          <div><Label htmlFor="amountDiscounted">Discount</Label><Input id="amountDiscounted" inputMode="decimal" value={value.amountDiscounted ?? ""} onChange={(e) => set("amountDiscounted", e.target.value)} disabled={!canReview} className={inputCls} />{fieldError("amountDiscounted")}</div>
         </div>
 
         {(value.seller || value.buyer || (value.taxes ?? []).length > 0 || (value.fees ?? []).length > 0 || (value.discounts ?? []).length > 0 || value.paymentDetails) && (
@@ -222,58 +233,113 @@ export function ReviewForm(props: {
           </div>
         )}
 
-        <div className="space-y-2">
-          <h3 className="text-sm font-medium">Line items</h3>
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-medium">Line items</h3>
+            {canReview && (
+              <Button type="button" variant="outline" size="sm" onClick={addLine}>
+                <Plus aria-hidden="true" /> Add line item
+              </Button>
+            )}
+          </div>
+          {fieldError("lineItems")}
+          {(value.lineItems ?? []).length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              No line items. Add one if the invoice itemizes charges.
+            </p>
+          )}
           {(value.lineItems ?? []).map((line, i) => (
-            <div key={i} className="grid gap-2 rounded-lg border border-border p-3 sm:grid-cols-5">
-              <Input placeholder="Description" value={line.description ?? ""} onChange={(e) => setLine(i, "description", e.target.value)} />
-              <Input placeholder="Qty" value={line.quantity ?? ""} onChange={(e) => setLine(i, "quantity", e.target.value)} />
-              <Input placeholder="Unit price" value={line.unitPrice ?? ""} onChange={(e) => setLine(i, "unitPrice", e.target.value)} />
-              <Input placeholder="Tax" value={line.taxAmount ?? ""} onChange={(e) => setLine(i, "taxAmount", e.target.value)} />
-              <Input placeholder="Line total" value={line.lineTotal ?? ""} onChange={(e) => setLine(i, "lineTotal", e.target.value)} />
+            <div key={i} className="rounded-lg border border-border p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Line {i + 1}
+                </span>
+                {canReview && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removeLine(i)}
+                    aria-label={`Remove line item ${i + 1}`}
+                  >
+                    <Trash2 aria-hidden="true" /> Remove
+                  </Button>
+                )}
+              </div>
+              <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                <div>
+                  <Label htmlFor={`li_${i}_description`} className="text-xs">Description</Label>
+                  <Input id={`li_${i}_description`} value={line.description ?? ""} onChange={(e) => setLine(i, "description", e.target.value)} disabled={!canReview} autoComplete="off" className="mt-1.5" />
+                </div>
+                <div>
+                  <Label htmlFor={`li_${i}_quantity`} className="text-xs">Qty</Label>
+                  <Input id={`li_${i}_quantity`} inputMode="decimal" value={line.quantity ?? ""} onChange={(e) => setLine(i, "quantity", e.target.value)} disabled={!canReview} autoComplete="off" className="mt-1.5" />
+                </div>
+                <div>
+                  <Label htmlFor={`li_${i}_unitPrice`} className="text-xs">Unit price</Label>
+                  <Input id={`li_${i}_unitPrice`} inputMode="decimal" value={line.unitPrice ?? ""} onChange={(e) => setLine(i, "unitPrice", e.target.value)} disabled={!canReview} autoComplete="off" className="mt-1.5" />
+                </div>
+                <div>
+                  <Label htmlFor={`li_${i}_taxAmount`} className="text-xs">Tax</Label>
+                  <Input id={`li_${i}_taxAmount`} inputMode="decimal" value={line.taxAmount ?? ""} onChange={(e) => setLine(i, "taxAmount", e.target.value)} disabled={!canReview} autoComplete="off" className="mt-1.5" />
+                </div>
+                <div>
+                  <Label htmlFor={`li_${i}_lineTotal`} className="text-xs">Line total</Label>
+                  <Input id={`li_${i}_lineTotal`} inputMode="decimal" value={line.lineTotal ?? ""} onChange={(e) => setLine(i, "lineTotal", e.target.value)} disabled={!canReview} autoComplete="off" className="mt-1.5" />
+                </div>
+              </div>
             </div>
           ))}
         </div>
 
-        <div className="flex flex-wrap items-end gap-3 border-t border-border pt-4">
-          <Button
-            type="button"
-            variant="secondary"
-            disabled={isPending}
-            onClick={() => run(saveCorrectionsAction)}
-          >
-            {isPending && <Loader2 className="size-4 animate-spin" />} Save corrections
-          </Button>
-          <Button
-            type="button"
-            disabled={isPending}
-            onClick={() => run(approveAction)}
-          >
-            {isPending && <Loader2 className="size-4 animate-spin" />} Approve
-          </Button>
-          <div className="flex flex-1 items-center gap-2 sm:justify-end">
-            <Input placeholder="Rejection note (optional)" value={note} onChange={(e) => { setNote(e.target.value); setValue((v) => v); }} className="max-w-xs" />
+        {canReview && (
+          <div className="flex flex-wrap items-end gap-3 border-t border-border pt-4">
             <Button
               type="button"
-              variant="destructive"
+              variant="secondary"
               disabled={isPending}
-              onClick={() => {
-                const fd = buildFormData(value);
-                fd.set("rejectionNote", note);
-                setGlobal(null);
-                setFieldErrors({});
-                startTransition(async () => {
-                  try {
-                    const state = await rejectAction(props.invoiceId, {}, fd);
-                    if (state?.global) setGlobal(state.global);
-                  } catch { /* redirect */ }
-                });
-              }}
+              onClick={() => run(saveCorrectionsAction)}
             >
-              {isPending && <Loader2 className="size-4 animate-spin" />} Reject
+              {isPending && <Loader2 className="size-4 animate-spin" />} Save corrections
             </Button>
+            <Button
+              type="button"
+              disabled={isPending}
+              onClick={() => run(approveAction)}
+            >
+              {isPending && <Loader2 className="size-4 animate-spin" />} Approve
+            </Button>
+            <div className="flex flex-1 items-center gap-2 sm:justify-end">
+              <Input
+                aria-label="Rejection note"
+                placeholder="Rejection note (optional)"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                className="max-w-xs"
+              />
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={isPending}
+                onClick={() => {
+                  const fd = buildReviewFormData(value);
+                  fd.set("rejectionNote", note);
+                  setGlobal(null);
+                  setMessage(null);
+                  setFieldErrors({});
+                  startTransition(async () => {
+                    try {
+                      const state = await rejectAction(props.invoiceId, {}, fd);
+                      if (state?.global) setGlobal(state.global);
+                    } catch { /* redirect */ }
+                  });
+                }}
+              >
+                {isPending && <Loader2 className="size-4 animate-spin" />} Reject
+              </Button>
+            </div>
           </div>
-        </div>
+        )}
       </form>
     </div>
   );

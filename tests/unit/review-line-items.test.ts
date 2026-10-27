@@ -115,4 +115,32 @@ describe("parseReviewForm line items", () => {
     if (!parsed.ok) return;
     expect(parsed.value.total).toBeNull();
   });
+
+  it("keeps source indexes aligned with the rows that survive", () => {
+    const parsed = parseReviewForm(
+      makeForm([
+        { description: "Widget", sourceIndex: "0" },
+        { description: "", sourceIndex: "1" },
+        { description: "Gadget", sourceIndex: "2" },
+      ]),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.lineItems?.map((line) => line.description)).toEqual(["Widget", "Gadget"]);
+    expect(parsed.lineSources).toEqual([0, 2]);
+  });
+
+  it("treats malformed source indexes as unassociated rows", () => {
+    const parsed = parseReviewForm(
+      makeForm([
+        { description: "A", sourceIndex: "-1" },
+        { description: "B", sourceIndex: "abc" },
+        { description: "C", sourceIndex: "1.5" },
+      ]),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.lineSources).toEqual([null, null, null]);
+    expect(parsed.value.lineItems?.[0]).not.toHaveProperty("sourceIndex");
+  });
 });

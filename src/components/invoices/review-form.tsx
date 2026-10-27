@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import type { ExtractionResult, LineItem } from "@/lib/pipeline/schema";
 import type { ValidationFinding, DuplicateFlags } from "@/types/invoice";
 import { approveAction, rejectAction, saveCorrectionsAction, type ReviewFormState } from "@/lib/review/actions";
-import { EMPTY_LINE, buildReviewFormData } from "@/lib/review/form-fields";
+import { EMPTY_LINE, buildReviewFormData, type ReviewFormValue } from "@/lib/review/form-fields";
 
 function formatPartyAddress(address: unknown): string {
   if (typeof address === "string") return address;
@@ -23,23 +23,25 @@ function formatPartyAddress(address: unknown): string {
   return "";
 }
 
-function emptyValue(): ExtractionResult {
+function emptyValue(): ReviewFormValue {
   return {
     supplierName: "", supplierTaxId: "", invoiceNumber: "", invoiceDate: "", dueDate: "",
     currencyCode: "", subtotal: "", taxTotal: "", total: "", paymentTerms: "",
     documentType: "", orderNumber: "", buyerName: "", buyerTaxId: "",
     shippingCost: "", amountPaid: "", balanceDue: "", amountDiscounted: "",
-    lineItems: [EMPTY_LINE],
+    lineItems: [],
   };
 }
 
-function toValue(initial: Partial<ExtractionResult> | null): ExtractionResult {
+function toValue(initial: Partial<ExtractionResult> | null): ReviewFormValue {
   const base = emptyValue();
-  if (!initial) return base;
+  if (!initial) return { ...base, lineItems: [{ ...EMPTY_LINE, sourceIndex: null }] };
   return {
     ...base,
     ...initial,
-    lineItems: (initial.lineItems?.length ? initial.lineItems : [EMPTY_LINE]).map((l) => ({ ...EMPTY_LINE, ...l })),
+    lineItems: initial.lineItems?.length
+      ? initial.lineItems.map((line, index) => ({ ...EMPTY_LINE, ...line, sourceIndex: index }))
+      : [{ ...EMPTY_LINE, sourceIndex: null }],
   };
 }
 
@@ -72,7 +74,7 @@ export function ReviewForm(props: {
   };
   const addLine = () => {
     setMessage(null);
-    setValue((v) => ({ ...v, lineItems: [...(v.lineItems ?? []), { ...EMPTY_LINE }] }));
+    setValue((v) => ({ ...v, lineItems: [...(v.lineItems ?? []), { ...EMPTY_LINE, sourceIndex: null }] }));
   };
   const removeLine = (index: number) => {
     setMessage(null);
@@ -93,6 +95,14 @@ export function ReviewForm(props: {
         if (state?.errors) setFieldErrors(state.errors);
         if (state?.global) setGlobal(state.global);
         if (state?.success && state.message) setMessage(state.message);
+        const savedLines = state?.lineItems;
+        if (state?.success && savedLines) {
+          // Saved rows are the new persisted order; future edits associate by it.
+          setValue((v) => ({
+            ...v,
+            lineItems: savedLines.map((line, index) => ({ ...EMPTY_LINE, ...line, sourceIndex: index })),
+          }));
+        }
       } catch {
         // Successful actions redirect; ignore the redirect signal.
       }

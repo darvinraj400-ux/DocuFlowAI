@@ -5,14 +5,16 @@ import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { parseReviewForm } from "@/lib/review/parse";
 import { mergeExtractionForReview } from "@/lib/review/merge";
+import { preserveUnknownLineItemFields } from "@/lib/review/line-items";
 import { captureCoverageFindings, materialConflictFindings, validateExtraction, hasErrorFindings } from "@/lib/pipeline/validate";
-import type { ExtractionResult } from "@/lib/pipeline/schema";
+import type { ExtractionResult, LineItem } from "@/lib/pipeline/schema";
 
 export interface ReviewFormState {
   errors?: Record<string, string>;
   global?: string;
   success?: boolean;
   message?: string;
+  lineItems?: LineItem[];
 }
 
 const CONFIG_ERROR = "Supabase is not configured. See the README.";
@@ -36,7 +38,7 @@ async function requireOwnedInvoice(invoiceId: string) {
   const admin = createAdminClient();
   const { data: invoice } = await admin
     .from("invoices")
-    .select("id,status,extracted_data")
+    .select("id,status,extracted_data,reviewed_data")
     .eq("id", invoiceId)
     .eq("user_id", user.id)
     .maybeSingle();
@@ -61,7 +63,14 @@ export async function saveCorrectionsAction(
   if ("error" in owned) return { global: owned.error };
 
   const extracted = owned.invoice?.extracted_data as Partial<ExtractionResult> | null | undefined;
+  const reviewed = owned.invoice?.reviewed_data as Partial<ExtractionResult> | null | undefined;
+  const source = mergeExtractionForReview(extracted, reviewed);
   const effective = mergeExtractionForReview(extracted, parsed.value);
+  effective.lineItems = preserveUnknownLineItemFields(
+    source.lineItems ?? [],
+    effective.lineItems ?? [],
+    parsed.lineSources,
+  );
 
   const { error } = await owned.admin
     .from("invoices")
@@ -82,7 +91,11 @@ export async function saveCorrectionsAction(
     // non-fatal
   }
 
-  return { success: true, message: "Corrections saved. The invoice remains awaiting review." };
+  return {
+    success: true,
+    message: "Corrections saved. The invoice remains awaiting review.",
+    lineItems: effective.lineItems ?? [],
+  };
 }
 
 export async function approveAction(
@@ -97,7 +110,14 @@ export async function approveAction(
   if ("error" in owned) return { global: owned.error };
 
   const extracted = owned.invoice?.extracted_data as Partial<ExtractionResult> | null | undefined;
+  const reviewed = owned.invoice?.reviewed_data as Partial<ExtractionResult> | null | undefined;
+  const source = mergeExtractionForReview(extracted, reviewed);
   const effective = mergeExtractionForReview(extracted, parsed.value);
+  effective.lineItems = preserveUnknownLineItemFields(
+    source.lineItems ?? [],
+    effective.lineItems ?? [],
+    parsed.lineSources,
+  );
 
   const findings = [
     ...validateExtraction(effective as ExtractionResult),

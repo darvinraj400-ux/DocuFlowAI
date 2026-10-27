@@ -87,4 +87,22 @@ describe("review form serialization", () => {
     });
     expect(parsed.value.lineItems?.[1]?.description).toBe("Gadget");
   });
+
+  it("serializes row source indexes and keeps them out of parsed line data", () => {
+    const fd = buildReviewFormData({
+      lineItems: [
+        { description: "Existing", sourceIndex: 1 },
+        { description: "New", sourceIndex: null },
+      ],
+    });
+
+    expect(fd.get("li_0_sourceIndex")).toBe("1");
+    expect(fd.get("li_1_sourceIndex")).toBe("");
+
+    const parsed = parseReviewForm(fd);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.lineSources).toEqual([1, null]);
+    expect(parsed.value.lineItems?.[0]).not.toHaveProperty("sourceIndex");
+  });
 });

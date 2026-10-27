@@ -246,6 +246,9 @@ export type ExtractionParseResult =
 /** All literal keys the canonical model understands (used by normalization). */
 export const CANONICAL_KEYS = new Set(Object.keys(extractionSchema.shape));
 
+/** Keys the canonical line-item schema understands; other keys are passthrough. */
+export const LINE_ITEM_KEYS = new Set(Object.keys(lineItemSchema.shape));
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

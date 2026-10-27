@@ -8,12 +8,24 @@ export const EMPTY_LINE: LineItem = {
   lineTotal: "",
 };
 
+export interface ReviewLineItem extends LineItem {
+  /**
+   * Index of this row in the server-rendered effective line-item array, used
+   * server-side to re-attach unknown extraction fields. New rows use `null`.
+   */
+  sourceIndex?: number | null;
+}
+
+export type ReviewFormValue = Omit<ExtractionResult, "lineItems"> & {
+  lineItems: ReviewLineItem[];
+};
+
 /**
  * Serializes every control the review form renders. Keep this in sync with
  * `parseReviewForm`: fields not serialized here are treated as untouched and
  * retain their extracted value.
  */
-export function buildReviewFormData(value: Partial<ExtractionResult>): FormData {
+export function buildReviewFormData(value: Partial<ReviewFormValue>): FormData {
   const fd = new FormData();
   const set = (key: string, val: string | null | undefined) =>
     fd.set(key, val == null ? "" : String(val));
@@ -38,6 +50,7 @@ export function buildReviewFormData(value: Partial<ExtractionResult>): FormData 
   set("amountDiscounted", value.amountDiscounted);
 
   (value.lineItems ?? []).forEach((line, i) => {
+    set(`li_${i}_sourceIndex`, line.sourceIndex == null ? "" : String(line.sourceIndex));
     set(`li_${i}_description`, line.description);
     set(`li_${i}_productCode`, line.productCode);
     set(`li_${i}_quantity`, line.quantity);

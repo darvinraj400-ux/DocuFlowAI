@@ -178,4 +178,218 @@ describe("review actions preserve effective data", () => {
     expect(res.global).toContain("NEGATIVE_AMOUNT");
     expect(updates).toHaveLength(0);
   });
+
+  it("preserves unknown line-item fields when a known field is edited", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      {
+        description: "Widget",
+        productCode: "SKU-1",
+        quantity: "1",
+        unitPrice: "10.00",
+        lineTotal: "10.00",
+        vendorSku: "EXT-9",
+        attributes: { color: "red" },
+      },
+    ];
+    const { updates } = setupAdmin(row);
+
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_sourceIndex: "0",
+        li_0_description: "Widget edited",
+        li_0_productCode: "SKU-1",
+        li_0_quantity: "1",
+        li_0_unitPrice: "10.00",
+        li_0_lineTotal: "10.00",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    expect(updates).toHaveLength(1);
+    const payload = updates[0]! as Record<string, unknown>;
+    expect(payload.extracted_data).toBeUndefined();
+    const lines = (payload.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines[0]).toMatchObject({
+      description: "Widget edited",
+      vendorSku: "EXT-9",
+      attributes: { color: "red" },
+    });
+    expect(res.lineItems).toHaveLength(1);
+    expect(res.lineItems?.[0]).toMatchObject({ description: "Widget edited", vendorSku: "EXT-9" });
+    expect(res.lineItems?.[0]).not.toHaveProperty("sourceIndex");
+  });
+
+  it("does not move a removed row's unknown fields onto the row that shifts up", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "First", lineTotal: "1.00", batchCode: "A" },
+      { description: "Second", lineTotal: "2.00", batchCode: "B" },
+    ];
+    const { updates } = setupAdmin(row);
+
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_sourceIndex: "1",
+        li_0_description: "Second",
+        li_0_lineTotal: "2.00",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    const lines = (updates[0]!.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ description: "Second", batchCode: "B" });
+    expect(lines[0]!.batchCode).not.toBe("A");
+  });
+
+  it("does not give newly added rows another item's unknown fields", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "Existing", lineTotal: "1.00", batchCode: "A" },
+    ];
+    const { updates } = setupAdmin(row);
+
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_sourceIndex: "0",
+        li_0_description: "Existing",
+        li_0_lineTotal: "1.00",
+        li_1_sourceIndex: "",
+        li_1_description: "New",
+        li_1_quantity: "2",
+        li_1_unitPrice: "3.50",
+        li_1_lineTotal: "7.00",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    const lines = (updates[0]!.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({ description: "Existing", batchCode: "A" });
+    expect(lines[1]).toMatchObject({ description: "New", lineTotal: "7.00" });
+    expect(Object.prototype.hasOwnProperty.call(lines[1], "batchCode")).toBe(false);
+  });
+
+  it("ignores client-submitted unrecognized line properties", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "Widget", lineTotal: "10.00", vendorSku: "SERVER-SIDE" },
+    ];
+    const { updates } = setupAdmin(row);
+
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_sourceIndex: "0",
+        li_0_description: "Widget",
+        li_0_lineTotal: "10.00",
+        li_0_vendorSku: "CLIENT-SIDE",
+        li_0_smuggled: "yes",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    const lines = (updates[0]!.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines[0]!.vendorSku).toBe("SERVER-SIDE");
+    expect(Object.prototype.hasOwnProperty.call(lines[0], "smuggled")).toBe(false);
+  });
+
+  it("keeps edited known fields and decimal precision exactly", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "Widget", quantity: "1", unitPrice: "10.00", lineTotal: "10.00", batchCode: "A" },
+    ];
+    const { updates } = setupAdmin(row);
+
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        total: "110.6700",
+        li_0_sourceIndex: "0",
+        li_0_description: "Widget",
+        li_0_quantity: "2",
+        li_0_unitPrice: "10.125",
+        li_0_lineTotal: "20.2500",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    const reviewed = updates[0]!.reviewed_data as Record<string, unknown>;
+    expect(reviewed.total).toBe("110.6700");
+    const lines = reviewed.lineItems as Array<Record<string, unknown>>;
+    expect(lines[0]).toMatchObject({
+      quantity: "2",
+      unitPrice: "10.125",
+      lineTotal: "20.2500",
+      batchCode: "A",
+    });
+  });
+
+  it("uses the current reviewed data, not extraction, as the preservation source", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "Original", lineTotal: "1.00", batchCode: "EXTRACTED" },
+    ];
+    (row as Record<string, unknown>).reviewed_data = {
+      lineItems: [{ description: "Presaved", lineTotal: "1.00", batchCode: "REVIEWED" }],
+    };
+    const { updates } = setupAdmin(row);
+
+    const res = await saveCorrectionsAction(
+      INVOICE_ID,
+      {},
+      makeForm({
+        li_0_sourceIndex: "0",
+        li_0_description: "Edited",
+        li_0_lineTotal: "1.00",
+      }),
+    );
+
+    expect(res.success).toBe(true);
+    const lines = (updates[0]!.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines[0]).toMatchObject({ description: "Edited", batchCode: "REVIEWED" });
+  });
+
+  it("preserves unknown line fields on approval and revalidates the merged invoice", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).lineItems = [
+      { description: "Widget", quantity: "1", unitPrice: "10.00", lineTotal: "10.00", batchCode: "A" },
+    ];
+    const { updates } = setupAdmin(row);
+
+    let error: unknown = null;
+    try {
+      await approveAction(
+        INVOICE_ID,
+        {},
+        makeForm({
+          li_0_sourceIndex: "0",
+          li_0_description: "Widget approved",
+          li_0_quantity: "1",
+          li_0_unitPrice: "10.00",
+          li_0_lineTotal: "10.00",
+        }),
+      );
+    } catch (err) {
+      error = err;
+    }
+
+    const digest = error instanceof Error ? (error as Error & { digest?: string }).digest : "";
+    expect(digest).toContain("/invoices/inv-1");
+    expect(updates).toHaveLength(1);
+    const payload = updates[0]! as Record<string, unknown>;
+    expect(payload.extracted_data).toBeUndefined();
+    expect(payload.status).toBe("approved");
+    const lines = (payload.reviewed_data as Record<string, unknown>).lineItems as Array<Record<string, unknown>>;
+    expect(lines[0]).toMatchObject({ description: "Widget approved", batchCode: "A" });
+  });
 });

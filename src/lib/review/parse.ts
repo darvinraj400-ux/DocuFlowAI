@@ -20,7 +20,7 @@ function flattenErrors(error: { issues: { path: PropertyKey[]; message: string }
 }
 
 export type ParsedReview =
-  | { ok: true; value: ExtractionResult }
+  | { ok: true; value: ExtractionResult; lineSources: Array<number | null> }
   | { ok: false; errors: Record<string, string> };
 
 /** Defensive upper bound for a server action payload; the review UI is far below it. */
@@ -39,6 +39,13 @@ function isBlankLineItem(line: LineItem): boolean {
     line.taxAmount,
     line.lineTotal,
   ].every((value) => value == null || value === "");
+}
+
+/** Row association token supplied by the form; anything malformed is a new row. */
+function parseSourceIndex(value: FormDataEntryValue | null): number | null {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  const index = Number(value);
+  return Number.isSafeInteger(index) ? index : null;
 }
 
 export function parseReviewForm(formData: FormData): ParsedReview {
@@ -84,28 +91,32 @@ export function parseReviewForm(formData: FormData): ParsedReview {
     setMoney(key);
   }
 
-  const lineItems: LineItem[] = [];
+  const rows: Array<{ line: LineItem; sourceIndex: number | null }> = [];
   for (let index = 0; index < MAX_LINE_ITEMS; index += 1) {
     if (formData.get(`li_${index}_description`) === null) break;
-    lineItems.push({
-      description: cleanText(formData.get(`li_${index}_description`)),
-      productCode: cleanText(formData.get(`li_${index}_productCode`)),
-      quantity: cleanMoney(formData.get(`li_${index}_quantity`)),
-      unit: cleanText(formData.get(`li_${index}_unit`)),
-      unitPrice: cleanMoney(formData.get(`li_${index}_unitPrice`)),
-      discountRate: cleanMoney(formData.get(`li_${index}_discountRate`)),
-      discountAmount: cleanMoney(formData.get(`li_${index}_discountAmount`)),
-      taxRate: cleanMoney(formData.get(`li_${index}_taxRate`)),
-      taxAmount: cleanMoney(formData.get(`li_${index}_taxAmount`)),
-      lineTotal: cleanMoney(formData.get(`li_${index}_lineTotal`)),
+    rows.push({
+      line: {
+        description: cleanText(formData.get(`li_${index}_description`)),
+        productCode: cleanText(formData.get(`li_${index}_productCode`)),
+        quantity: cleanMoney(formData.get(`li_${index}_quantity`)),
+        unit: cleanText(formData.get(`li_${index}_unit`)),
+        unitPrice: cleanMoney(formData.get(`li_${index}_unitPrice`)),
+        discountRate: cleanMoney(formData.get(`li_${index}_discountRate`)),
+        discountAmount: cleanMoney(formData.get(`li_${index}_discountAmount`)),
+        taxRate: cleanMoney(formData.get(`li_${index}_taxRate`)),
+        taxAmount: cleanMoney(formData.get(`li_${index}_taxAmount`)),
+        lineTotal: cleanMoney(formData.get(`li_${index}_lineTotal`)),
+      },
+      sourceIndex: parseSourceIndex(formData.get(`li_${index}_sourceIndex`)),
     });
   }
   // A blank row is UI scaffolding, not an intentional line item.
-  candidate.lineItems = lineItems.filter((line) => !isBlankLineItem(line));
+  const kept = rows.filter((row) => !isBlankLineItem(row.line));
+  candidate.lineItems = kept.map((row) => row.line);
 
   const parsed = extractionSchema.safeParse(candidate);
   if (!parsed.success) {
     return { ok: false, errors: flattenErrors(parsed.error) };
   }
-  return { ok: true, value: parsed.data };
+  return { ok: true, value: parsed.data, lineSources: kept.map((row) => row.sourceIndex) };
 }

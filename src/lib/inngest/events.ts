@@ -19,3 +19,23 @@ export function parseProcessingEvent(data: unknown): InvoiceProcessingRequestedD
   const result = eventDataSchema.safeParse(data);
   return result.success ? result.data : null;
 }
+
+export const INVOICE_APPROVED_WEBHOOK_REQUESTED = "invoice/approved.webhook.requested";
+
+export interface InvoiceApprovedWebhookData {
+  invoiceId: string;
+  ownerId: string;
+  approvedAt: string;
+}
+
+const approvedWebhookEventDataSchema = z.object({
+  invoiceId: z.uuid(),
+  ownerId: z.uuid(),
+  approvedAt: z.iso.datetime(),
+});
+
+/** Events are a trust boundary: only identifiers this app issued are accepted. */
+export function parseApprovedWebhookEvent(data: unknown): InvoiceApprovedWebhookData | null {
+  const result = approvedWebhookEventDataSchema.safeParse(data);
+  return result.success ? result.data : null;
+}

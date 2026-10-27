@@ -1,9 +1,18 @@
 import { DEFAULT_MAX_CONCURRENT_PROCESSING, getAiConfig } from "@/lib/env";
 import { createProvider } from "@/lib/providers";
 import { inngest } from "@/lib/inngest/client";
-import { INVOICE_PROCESSING_REQUESTED, parseProcessingEvent } from "@/lib/inngest/events";
+import {
+  INVOICE_APPROVED_WEBHOOK_REQUESTED,
+  INVOICE_PROCESSING_REQUESTED,
+  parseApprovedWebhookEvent,
+  parseProcessingEvent,
+} from "@/lib/inngest/events";
 import { createProcessInvoiceHandler } from "@/lib/inngest/job-handler";
 import { createSupabaseInvoiceJobStore } from "@/lib/inngest/job-store";
+import { getN8nConfig } from "@/lib/n8n/config";
+import { deliverWebhook } from "@/lib/n8n/delivery";
+import { createSendApprovedWebhookHandler } from "@/lib/n8n/handler";
+import { createSupabaseWebhookStore } from "@/lib/n8n/store";
 
 function userConcurrencyLimit(): number {
   const parsed = Number.parseInt(process.env.MAX_CONCURRENT_PROCESSING ?? "", 10);
@@ -64,4 +73,54 @@ export const processInvoiceFunction = inngest.createFunction(
   handler,
 );
 
-export const functions = [processInvoiceFunction];
+const approvedWebhookHandler = createSendApprovedWebhookHandler(() => ({
+  config: getN8nConfig(),
+  store: createSupabaseWebhookStore(),
+  deliver: deliverWebhook,
+}));
+
+export const sendInvoiceApprovedWebhookFunction = inngest.createFunction(
+  {
+    id: "send-invoice-approved-webhook",
+    name: "Send approved invoice webhook",
+    // HTTP delivery retries are bounded inside the handler. These retries only
+    // cover unexpected infrastructure errors, so a controlled delivery failure
+    // is returned once and never multiplied by the platform.
+    retries: 2,
+    concurrency: [{ limit: 1, key: "event.data.invoiceId" }],
+    triggers: [{ event: INVOICE_APPROVED_WEBHOOK_REQUESTED }],
+    onFailure: async ({ event, error }) => {
+      const original = event.data.event as { data?: unknown } | undefined;
+      const parsed = parseApprovedWebhookEvent(original?.data);
+      if (!parsed) return;
+
+      console.error(
+        "[n8n] approved-webhook function failed",
+        JSON.stringify({
+          invoiceId: parsed.invoiceId,
+          errorName: error?.name ?? "Error",
+        }),
+      );
+
+      try {
+        await createSupabaseWebhookStore().recordFailure({
+          invoiceId: parsed.invoiceId,
+          ownerId: parsed.ownerId,
+          code: "WEBHOOK_FUNCTION_FAILED",
+          attempts: 0,
+        });
+      } catch (err) {
+        console.error(
+          "[n8n] could not record terminal webhook failure",
+          JSON.stringify({
+            invoiceId: parsed.invoiceId,
+            errorName: err instanceof Error ? err.name : "Error",
+          }),
+        );
+      }
+    },
+  },
+  approvedWebhookHandler,
+);
+
+export const functions = [processInvoiceFunction, sendInvoiceApprovedWebhookFunction];

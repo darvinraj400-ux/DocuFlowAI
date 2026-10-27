@@ -8,6 +8,7 @@ import { ReviewForm } from "@/components/invoices/review-form";
 import { ProcessingStatus } from "@/components/invoices/processing-status";
 import { ExtractionInventory } from "@/components/invoices/extraction-inventory";
 import { mergeExtractionForReview } from "@/lib/review/merge";
+import { auditEventDetail, auditEventLabel } from "@/lib/n8n/labels";
 import { buildInvoiceProgress } from "@/lib/invoice-progress";
 import type { ValidationFinding, DuplicateFlags, InvoiceStatus } from "@/types/invoice";
 import type { ExtractionResult } from "@/lib/pipeline/schema";
@@ -141,12 +142,18 @@ export default async function InvoiceDetailPage({
             <div className="rounded-xl border border-border p-4 text-sm">
               <h3 className="text-sm font-medium">Audit history</h3>
               <ul className="mt-2 space-y-1 text-muted-foreground">
-                {events.map((ev, i) => (
-                  <li key={i} className="flex justify-between gap-2">
-                    <span>{ev.event_type.replace("_", " ")}</span>
-                    <span className="text-xs">{new Date(ev.created_at).toLocaleString()}</span>
-                  </li>
-                ))}
+                {events.map((ev, i) => {
+                  const detail = auditEventDetail(ev);
+                  return (
+                    <li key={i} className="flex justify-between gap-2">
+                      <span>
+                        {auditEventLabel(ev)}
+                        {detail && <span className="ml-2 text-xs">({detail})</span>}
+                      </span>
+                      <span className="text-xs">{new Date(ev.created_at).toLocaleString()}</span>
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           )}

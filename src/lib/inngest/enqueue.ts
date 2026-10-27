@@ -1,6 +1,8 @@
 import { inngest, isInngestDevMode } from "@/lib/inngest/client";
 import {
+  INVOICE_APPROVED_WEBHOOK_REQUESTED,
   INVOICE_PROCESSING_REQUESTED,
+  type InvoiceApprovedWebhookData,
   type InvoiceProcessingRequestedData,
 } from "@/lib/inngest/events";
 
@@ -34,4 +36,24 @@ export async function enqueueInvoiceProcessing(data: InvoiceProcessingRequestedD
   });
 
   if (!result?.ids?.length) throw new Error("Inngest did not accept the processing event.");
+}
+
+/**
+ * Queues the approved-invoice webhook. The deterministic event id means a
+ * repeated send for the same invoice is deduplicated by Inngest.
+ */
+export async function enqueueInvoiceApprovedWebhook(
+  data: InvoiceApprovedWebhookData,
+): Promise<void> {
+  if (!isInngestConfigured()) throw new InngestNotConfiguredError();
+
+  const result = await inngest.send({
+    id: `invoice-approved-webhook-${data.invoiceId}`,
+    name: INVOICE_APPROVED_WEBHOOK_REQUESTED,
+    data,
+  });
+
+  if (!result?.ids?.length) {
+    throw new Error("Inngest did not accept the approved-invoice webhook event.");
+  }
 }

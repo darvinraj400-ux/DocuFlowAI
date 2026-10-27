@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   getUser: vi.fn(),
   createClient: vi.fn(),
   createAdminClient: vi.fn(),
+  enqueueApprovedInvoiceWebhook: vi.fn(),
 }));
 
 vi.mock("@/lib/supabase/server", () => ({
@@ -12,6 +13,10 @@ vi.mock("@/lib/supabase/server", () => ({
 
 vi.mock("@/lib/supabase/admin", () => ({
   createAdminClient: mocks.createAdminClient,
+}));
+
+vi.mock("@/lib/n8n/approval", () => ({
+  enqueueApprovedInvoiceWebhook: mocks.enqueueApprovedInvoiceWebhook,
 }));
 
 import { approveAction, saveCorrectionsAction } from "@/lib/review/actions";
@@ -59,6 +64,7 @@ function makeForm(overrides: Record<string, string> = {}) {
 function setupAdmin(row: Record<string, unknown>) {
   let stored = { ...row };
   const updates: Array<Record<string, unknown>> = [];
+  const eventInserts: Array<Record<string, unknown>> = [];
   const table = {
     select: vi.fn(() => {
       const chain = {
@@ -79,11 +85,16 @@ function setupAdmin(row: Record<string, unknown>) {
   const admin = {
     from: vi.fn((name: string) => {
       if (name === "invoices") return table;
-      return { insert: vi.fn(async () => ({ error: null })) };
+      return {
+        insert: vi.fn(async (payload: Record<string, unknown>) => {
+          eventInserts.push(payload);
+          return { error: null };
+        }),
+      };
     }),
   };
   mocks.createAdminClient.mockReturnValue(admin);
-  return { updates, admin };
+  return { updates, eventInserts, admin };
 }
 
 describe("review actions preserve effective data", () => {
@@ -91,6 +102,7 @@ describe("review actions preserve effective data", () => {
     vi.clearAllMocks();
     mocks.createClient.mockResolvedValue({ auth: { getUser: mocks.getUser } });
     mocks.getUser.mockResolvedValue({ data: { user: { id: USER_ID } }, error: null });
+    mocks.enqueueApprovedInvoiceWebhook.mockResolvedValue("disabled");
   });
 
   it("saveCorrections persists merged reviewed_data and keeps extracted_data untouched", async () => {
@@ -129,6 +141,120 @@ describe("review actions preserve effective data", () => {
     setupAdmin(row);
     const res = await approveAction(INVOICE_ID, {}, makeForm({ total: "" }));
     expect(res.global).toContain("MISSING_TOTAL");
+  });
+
+  it("queues the webhook only after the approval update is persisted", async () => {
+    const { updates } = setupAdmin(extractedRow());
+    let updatesAtEnqueue = -1;
+    mocks.enqueueApprovedInvoiceWebhook.mockImplementation(async () => {
+      updatesAtEnqueue = updates.length;
+      return "queued";
+    });
+
+    let error: unknown = null;
+    try {
+      await approveAction(INVOICE_ID, {}, makeForm());
+    } catch (err) {
+      error = err;
+    }
+
+    const digest = error instanceof Error ? (error as Error & { digest?: string }).digest : "";
+    expect(digest).toContain("/invoices/inv-1");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.status).toBe("approved");
+    expect(updatesAtEnqueue).toBe(1);
+    expect(mocks.enqueueApprovedInvoiceWebhook).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueApprovedInvoiceWebhook).toHaveBeenCalledWith({
+      invoiceId: INVOICE_ID,
+      ownerId: USER_ID,
+      approvedAt: expect.any(String),
+    });
+  });
+
+  it("does not queue the webhook when approval validation blocks the action", async () => {
+    const row = extractedRow();
+    (row.extracted_data as Record<string, unknown>).total = null;
+    setupAdmin(row);
+
+    const res = await approveAction(INVOICE_ID, {}, makeForm({ total: "" }));
+
+    expect(res.global).toContain("MISSING_TOTAL");
+    expect(mocks.enqueueApprovedInvoiceWebhook).not.toHaveBeenCalled();
+  });
+
+  it("does not queue the webhook when corrections are saved", async () => {
+    setupAdmin(extractedRow());
+
+    await saveCorrectionsAction(INVOICE_ID, {}, makeForm());
+
+    expect(mocks.enqueueApprovedInvoiceWebhook).not.toHaveBeenCalled();
+  });
+
+  it("keeps the approval successful and records an audit marker when queueing fails", async () => {
+    const { updates, eventInserts } = setupAdmin(extractedRow());
+    mocks.enqueueApprovedInvoiceWebhook.mockResolvedValue("failed");
+
+    let error: unknown = null;
+    try {
+      await approveAction(INVOICE_ID, {}, makeForm());
+    } catch (err) {
+      error = err;
+    }
+
+    const digest = error instanceof Error ? (error as Error & { digest?: string }).digest : "";
+    expect(digest).toContain("/invoices/inv-1");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.status).toBe("approved");
+    expect(eventInserts.some((event) => event.event_type === "approved")).toBe(true);
+    expect(eventInserts).toContainEqual(
+      expect.objectContaining({
+        invoice_id: INVOICE_ID,
+        event_type: "status_changed",
+        metadata: { action: "webhook_enqueue_failed" },
+      }),
+    );
+  });
+
+  it("does not record a queueing failure marker when the webhook is disabled", async () => {
+    const { eventInserts } = setupAdmin(extractedRow());
+
+    let error: unknown = null;
+    try {
+      await approveAction(INVOICE_ID, {}, makeForm());
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toBeDefined();
+    expect(
+      eventInserts.some(
+        (event) =>
+          (event.metadata as Record<string, unknown> | undefined)?.action ===
+          "webhook_enqueue_failed",
+      ),
+    ).toBe(false);
+  });
+
+  it("does not let an unexpected queueing error block approval", async () => {
+    const { updates } = setupAdmin(extractedRow());
+    mocks.enqueueApprovedInvoiceWebhook.mockRejectedValue(new Error("boom"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      let error: unknown = null;
+      try {
+        await approveAction(INVOICE_ID, {}, makeForm());
+      } catch (err) {
+        error = err;
+      }
+
+      const digest = error instanceof Error ? (error as Error & { digest?: string }).digest : "";
+      expect(digest).toContain("/invoices/inv-1");
+      expect(updates).toHaveLength(1);
+      expect(updates[0]!.status).toBe("approved");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("persists added and edited line items in reviewed_data only", async () => {

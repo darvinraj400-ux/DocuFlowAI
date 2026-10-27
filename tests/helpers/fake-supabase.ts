@@ -37,6 +37,7 @@ class FakeQuery implements PromiseLike<QueryResult> {
   private mode: Mode | null = null;
   private payload: Row | Row[] | null = null;
   private filters: Filter[] = [];
+  private maxRows: number | null = null;
 
   constructor(
     private readonly admin: FakeSupabaseAdmin,
@@ -87,6 +88,11 @@ class FakeQuery implements PromiseLike<QueryResult> {
 
   contains(column: string, value: unknown): this {
     this.filters.push({ type: "contains", column, value });
+    return this;
+  }
+
+  limit(count: number): this {
+    this.maxRows = Math.max(0, Math.floor(count));
     return this;
   }
 
@@ -153,7 +159,9 @@ class FakeQuery implements PromiseLike<QueryResult> {
       return [];
     }
 
-    return matched.map((row) => ({ ...row }));
+    return (this.maxRows == null ? matched : matched.slice(0, this.maxRows)).map((row) => ({
+      ...row,
+    }));
   }
 }
 
@@ -234,6 +242,8 @@ export function seedInvoice(
     extractionMeta?: Record<string, unknown> | null;
     fileSha256?: string | null;
     extractedData?: Record<string, unknown> | null;
+    reviewedData?: Record<string, unknown> | null;
+    reviewedAt?: string | null;
   },
 ): SeededInvoice {
   const ownerId = input.ownerId ?? randomUUID();
@@ -252,7 +262,8 @@ export function seedInvoice(
     file_size_bytes: input.bytes.byteLength,
     file_sha256: input.fileSha256 ?? null,
     extracted_data: input.extractedData ?? null,
-    reviewed_data: null,
+    reviewed_data: input.reviewedData ?? null,
+    reviewed_at: input.reviewedAt ?? null,
     validation_findings: [],
     duplicate_flags: null,
     error_info: null,

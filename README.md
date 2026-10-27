@@ -22,6 +22,8 @@ Browser ──► Next.js 16 (App Router)
               │
               ├─ Inngest durable `process-invoice` function
               │    └─ one step per PDF page batch, DB checkpoints, fenced finalize
+              ├─ Inngest durable `send-invoice-approved-webhook` function (optional)
+              │    └─ POST the approved invoice to n8n with bounded retries
               ├─ Supabase Auth (SSR, PKCE)
               ├─ Supabase PostgreSQL + RLS
               ├─ Supabase Storage (private, owner-scoped signed URLs)
@@ -40,7 +42,7 @@ validates the private file, extracts each PDF page batch in its own
 deterministically, then performs a single fenced transition to `needs_review`
 (never auto-approve). Failures are recorded as `failed` with a retry path.
 
-## What works (Phases 1–4)
+## What works (Phases 1–5)
 
 - Direct-to-Storage upload with server-validated upload-intent.
 - Secure enqueue endpoint plus a durable Inngest worker (atomic claim, bounded
@@ -65,6 +67,9 @@ deterministically, then performs a single fenced transition to `needs_review`
   structure, and validation behavior. The mock baseline is deterministic and
   asserted offline; live Gemini runs are opt-in and recorded without accuracy
   assertions.
+- Optional, disabled-by-default n8n webhook delivery for approved invoices,
+  queued through the existing Inngest worker with an allowlisted payload,
+  idempotency key, bounded retries, and auditable success/failure.
 - Real dashboard metrics from the database (honest empty states).
 
 ## Stack
@@ -243,7 +248,11 @@ plus durable processing: event validation, enqueue success/failure,
 owner-scoped status refresh and polling termination, per-batch retry/resume
 from checkpoints, page-number preservation and coverage grounding,
 exactly-once finalization, partial/terminal failures, and superseded-job
-fencing. Inngest and AI providers are mocked; no live calls are needed.
+fencing. The optional n8n suite mocks the webhook endpoint and covers trigger
+conditions, payload allowlisting, disabled/unconfigured behavior, success,
+transient retry bounds, permanent failures, duplicate suppression, audit
+markers, and approval isolation from downstream failures. Inngest and AI
+providers are mocked; no live calls are needed.
 
 Live RLS integration tests (`tests/integration/rls.test.ts`) are gated on real
 Supabase test credentials and skipped otherwise.
@@ -272,6 +281,145 @@ Supabase test credentials and skipped otherwise.
   `extracted_data`. Approval sets `approved` only after re-validating and
   clearing error findings; rejection records the reviewer, time, and optional
   note. Both write audit events.
+
+## Optional n8n webhook integration (Phase 5)
+
+The integration is **disabled by default**. When `N8N_WEBHOOK_URL` is set, a
+successfully approved invoice is POSTed to n8n through the existing Inngest
+durability — there is no second job system. Rejected, failed, still-processing,
+or validation-blocked invoices are never sent, and approvals made before the
+webhook was enabled are not replayed.
+
+### Trigger and delivery path
+
+1. A signed-in user approves an invoice from `needs_review`.
+2. The approval update, effective reviewed data, and `approved` audit event are
+   persisted.
+3. The server action queues `invoice/approved.webhook.requested`
+   (`invoiceId`, `ownerId`, `approvedAt`) with a deterministic event id
+   (`invoice-approved-webhook-<invoiceId>`).
+4. The durable `send-invoice-approved-webhook` function reloads the invoice with
+   the service-role client scoped by both id and owner, requires status
+   `approved`, and skips if a `webhook_sent` audit event already exists.
+5. It POSTs the allowlisted payload with
+   `Idempotency-Key: invoice-approved:<invoiceId>`.
+
+### Payload
+
+Only the fields below are sent. Money and quantity values are decimal strings;
+absent values are `null`.
+
+```json
+{
+  "event": "invoice.approved",
+  "invoice": {
+    "id": "…",
+    "invoiceNumber": "INV-77",
+    "supplierName": "Acme Supplies",
+    "invoiceDate": "2026-01-01",
+    "dueDate": "2026-01-31",
+    "currencyCode": "USD",
+    "subtotal": "100.00",
+    "taxTotal": "8.00",
+    "shippingCost": "2.00",
+    "total": "110.00",
+    "paymentTerms": "Net 30",
+    "approvedAt": "2026-01-02T03:04:05.000Z",
+    "lineItems": [
+      {
+        "description": "Widget",
+        "productCode": "SKU-1",
+        "quantity": "2",
+        "unitPrice": "50.00",
+        "lineTotal": "100.00"
+      }
+    ]
+  }
+}
+```
+
+The PDF, storage path, owner account, supplier/buyer contact details,
+payment/bank details, raw extraction JSON, capture text, validation findings,
+and audit metadata are never sent.
+
+### Retries, duplicates, and failure handling
+
+- Each attempt has a 10-second timeout, with up to 3 attempts and exponential
+  backoff (500 ms, then 1 s) for network errors, timeouts, HTTP 408, 425, 429,
+  and 5xx responses. Other 4xx responses fail immediately. Redirects are
+  refused rather than followed, so the payload cannot be forwarded to another
+  host.
+- Success writes a `webhook_sent` audit event with the HTTP status and attempt
+  count. A terminal failure writes a `status_changed` audit event with
+  `metadata.action = "webhook_delivery_failed"` and safe diagnostics (code,
+  HTTP status, attempts), and logs `[n8n] webhook delivery failed` with only the
+  invoice id, code, status, and attempts.
+- The webhook URL, headers, response bodies, invoice contents, and credentials
+  are never logged.
+- Approval remains `approved` if queueing or delivery fails; the failure is
+  recorded in the invoice audit history and server logs, never shown as an
+  approval error.
+- Duplicate controls: deterministic Inngest event id, per-invoice Inngest
+  concurrency of 1, `step.run()` memoization, the `webhook_sent` marker, and the
+  idempotency header. Delivery is at-least-once around an edge crash (for
+  example, if the process dies after n8n receives the request but before the
+  audit marker is written), so downstream workflows should treat the
+  `Idempotency-Key` as authoritative.
+- A controlled delivery failure is returned as a final result, so Inngest does
+  not multiply the bounded HTTP retries. The function-level retries only cover
+  unexpected infrastructure errors.
+
+### Configuration and local setup
+
+Only `N8N_WEBHOOK_URL` is needed. It is a server-only variable; never prefix it
+with `NEXT_PUBLIC_` and never commit it:
+
+```bash
+N8N_WEBHOOK_URL=http://localhost:5678/webhook/docuflow-approved
+```
+
+Blank or unset disables the integration. The URL must use `http` or `https`; a
+malformed value disables only the webhook (with a fixed warning) and never
+blocks the app or invoice approval. n8n webhook URLs commonly embed a secret
+token, so treat the URL itself as a credential.
+
+1. Start n8n locally, for example:
+
+   ```bash
+   npx n8n
+   # or
+   docker run -it --rm --name n8n -p 5678:5678 docker.n8n.io/n8nio/n8n
+   ```
+
+2. Create a workflow with a **Webhook** node: method `POST` and respond
+   immediately. Copy the **production** webhook URL — the test URL only listens
+   while the n8n editor is waiting for a test event.
+3. Add `N8N_WEBHOOK_URL` to `.env.local`, restart Next.js, and keep the Inngest
+   Dev Server running:
+
+   ```powershell
+   npx inngest-cli@latest dev -u http://localhost:3000/api/inngest
+   ```
+
+4. Approve an invoice. The n8n execution list should show one request and the
+   invoice's audit history should show **webhook delivered**.
+
+To diagnose failures, check:
+
+- the invoice audit history for **webhook delivery failed** (with code and HTTP
+  status) or **webhook queueing failed**;
+- the server logs for `[n8n] webhook delivery failed` or
+  `[n8n] could not queue approved-invoice webhook`;
+- the Inngest run for `send-invoice-approved-webhook`;
+- that n8n is running, the URL is the production webhook URL, the node accepts
+  `POST`, and it returns a 2xx response. A 3xx is treated as a failure on
+  purpose.
+
+There is no automatic replay button. A delivery that exhausts its attempts is
+recorded as failed for diagnosis; re-sending requires a deliberate operational
+action (for example, replaying the event in Inngest or posting the payload from
+n8n tooling). If Inngest is unavailable at approval time, the approval still
+succeeds and a `webhook_enqueue_failed` audit marker is recorded.
 
 ## Live verification & evaluation
 
@@ -350,6 +498,11 @@ supported model — the code does not silently pick another model.
   running; without it enqueue returns `503 ENQUEUE_FAILED` and the invoice is
   left retryable — it is never reported as completed. Production needs Inngest
   Cloud or a self-hosted Inngest server.
+- The n8n webhook is optional and requires both `N8N_WEBHOOK_URL` and a working
+  Inngest worker at approval time. It fires only for approvals made while it is
+  enabled, has no automatic replay, and is at-least-once around an edge crash;
+  downstream workflows should deduplicate with the `Idempotency-Key`. A failed
+  delivery leaves the invoice approved and visible as a failed audit event.
 - PDFs are extracted in 3-page batches (one durable step each) and bounded by
   `MAX_PDF_PAGES` (default 10); `MAX_CONCURRENT_PROCESSING` caps concurrent
   jobs per user in both the UI and the Inngest function.
@@ -370,13 +523,14 @@ supported model — the code does not silently pick another model.
    - **Production**: the real Supabase URL/publishable key, service-role key,
      Gemini key, `NEXT_PUBLIC_SITE_URL`, model/page-limit settings, plus
      `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` (or point at a self-hosted
-     Inngest server). Never set `AI_PROVIDER=mock` here (mock is for
-     local/demo only).
+     Inngest server). Add `N8N_WEBHOOK_URL` only if you want webhook delivery;
+     leave it unset to keep the integration disabled. Never set
+     `AI_PROVIDER=mock` here (mock is for local/demo only).
    - **Preview**: a separate Supabase Preview/Test project if you want isolated
      data; otherwise the same variables (or a staging project).
    - **Development**: local `.env.local` values.
 3. Register `https://<app>.vercel.app/api/inngest` with Inngest and confirm the
-   `process-invoice` function syncs.
+   `process-invoice` and `send-invoice-approved-webhook` functions sync.
 4. Deploy. Check `https://<app>.vercel.app/api/health` — the `readiness`
    block reports `supabaseConfigured`, `serverCredentialsConfigured`, and
    `extractionProvider` without exposing secrets.
@@ -399,4 +553,5 @@ and returns as soon as Inngest accepts the event. Uploads remain bounded by the
 - Phase 2 — upload, processing pipeline, validation, review (done).
 - Phase 3 — search, settings, better line-item editing (done).
 - Phase 4 — deeper AI evaluation and extraction-accuracy reporting (done).
-- Phase 5 — optional n8n webhook integration (disabled by default).
+- Phase 5 — optional n8n webhook integration (done; disabled unless
+  `N8N_WEBHOOK_URL` is set).

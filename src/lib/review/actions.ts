@@ -7,6 +7,7 @@ import { parseReviewForm } from "@/lib/review/parse";
 import { mergeExtractionForReview } from "@/lib/review/merge";
 import { preserveUnknownLineItemFields } from "@/lib/review/line-items";
 import { captureCoverageFindings, materialConflictFindings, validateExtraction, hasErrorFindings } from "@/lib/pipeline/validate";
+import { enqueueApprovedInvoiceWebhook } from "@/lib/n8n/approval";
 import type { ExtractionResult, LineItem } from "@/lib/pipeline/schema";
 
 export interface ReviewFormState {
@@ -153,6 +154,40 @@ export async function approveAction(
     });
   } catch {
     // non-fatal
+  }
+
+  // The approval is already durable. Queueing the optional webhook must never
+  // turn a successful approval into an apparent failure.
+  let webhookFailed = false;
+  try {
+    webhookFailed =
+      (await enqueueApprovedInvoiceWebhook({
+        invoiceId,
+        ownerId: owned.user!.id,
+        approvedAt: now,
+      })) === "failed";
+  } catch (err) {
+    webhookFailed = true;
+    console.error(
+      "[n8n] could not queue approved-invoice webhook",
+      JSON.stringify({
+        invoiceId,
+        errorName: err instanceof Error ? err.name : "Error",
+      }),
+    );
+  }
+
+  if (webhookFailed) {
+    try {
+      await owned.admin.from("invoice_events").insert({
+        invoice_id: invoiceId,
+        actor: owned.user!.id,
+        event_type: "status_changed",
+        metadata: { action: "webhook_enqueue_failed" },
+      });
+    } catch {
+      // non-fatal: the approval itself succeeded
+    }
   }
 
   redirect(`/invoices/${invoiceId}`);

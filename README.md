@@ -17,6 +17,7 @@ Browser ──► Next.js 16 (App Router)
               │  ├─ /api/inngest                (Inngest serve handler)
               │  ├─ /invoices        (search, status filter, pagination)
               │  ├─ /invoices/:id    (progress / review UI)
+              │  ├─ /reports         (read-only extraction-accuracy report)
               │  └─ /settings        (account + read-only processing config)
               │
               ├─ Inngest durable `process-invoice` function
@@ -39,7 +40,7 @@ validates the private file, extracts each PDF page batch in its own
 deterministically, then performs a single fenced transition to `needs_review`
 (never auto-approve). Failures are recorded as `failed` with a retry path.
 
-## What works (Phases 1–3)
+## What works (Phases 1–4)
 
 - Direct-to-Storage upload with server-validated upload-intent.
 - Secure enqueue endpoint plus a durable Inngest worker (atomic claim, bounded
@@ -55,6 +56,15 @@ deterministically, then performs a single fenced transition to `needs_review`
   view of processing configuration — no secrets are exposed.
 - Line-item add/edit/remove in review, with decimal validation and preservation
   of extraction-only line fields; edits are stored as `reviewed_data`.
+- Extraction-accuracy reporting at `/reports`, comparing approved invoices'
+  immutable AI output with the human-approved snapshot. It reports per-field
+  matches, corrections, missed/cleared values, line-item structure changes, and
+  honest empty states without modifying any invoice data.
+- A provider-agnostic evaluation harness over four synthetic invoices that
+  reports field-level exact-match, missing/invented values, line-item and tax
+  structure, and validation behavior. The mock baseline is deterministic and
+  asserted offline; live Gemini runs are opt-in and recorded without accuracy
+  assertions.
 - Real dashboard metrics from the database (honest empty states).
 
 ## Stack
@@ -215,6 +225,7 @@ that needs no API key and no network. The UI visibly labels results as
 
 ```bash
 pnpm test          # mocked suite — no paid API calls, no live credentials
+pnpm evaluate      # extraction evaluation harness (mock baseline offline)
 pnpm typecheck
 pnpm lint
 pnpm build
@@ -224,12 +235,15 @@ Test coverage includes: extraction schema parsing, missing fields, provider
 error handling, PDF/PNG/JPEG validation, oversized/invalid files, PDF page
 limits, decimal arithmetic/tolerance, duplicate file & supplier/number
 detection, status transitions, concurrent claims, ownership checks, save /
-approve / reject validation, dashboard metrics and empty states, plus durable
-processing: event validation, enqueue success/failure, owner-scoped status
-refresh and polling termination, per-batch retry/resume from checkpoints,
-page-number preservation and coverage grounding, exactly-once finalization,
-partial/terminal failures, and superseded-job fencing. Inngest and AI providers
-are mocked; no live calls are needed.
+approve / reject validation, dashboard metrics and empty states, accuracy value
+normalization, extraction-accuracy report aggregation (missing reviewed
+snapshots, structural line-item edits, report bounds), evaluation comparison
+and reporting (matches, mismatches, missing/invented values, provider failures),
+plus durable processing: event validation, enqueue success/failure,
+owner-scoped status refresh and polling termination, per-batch retry/resume
+from checkpoints, page-number preservation and coverage grounding,
+exactly-once finalization, partial/terminal failures, and superseded-job
+fencing. Inngest and AI providers are mocked; no live calls are needed.
 
 Live RLS integration tests (`tests/integration/rls.test.ts`) are gated on real
 Supabase test credentials and skipped otherwise.
@@ -272,13 +286,22 @@ skipped unless the relevant flag and credentials are present:
 - Gemini smoke/evaluation (`tests/integration/live-gemini.test.ts`,
   `tests/evaluation/extraction-accuracy.test.ts`) — requires
   `RUN_LIVE_GEMINI_TESTS=true` and `GEMINI_API_KEY`. The evaluation harness
-  reports field-level exact-match, missing-field, and validation behavior for
-  synthetic invoices. Mock results are deterministic and asserted; live results
-  are recorded (not fabricated) and are not auto-asserted to a target accuracy.
+  (`pnpm evaluate`) runs four synthetic invoices — a single-line GBP baseline,
+  a multi-line EUR invoice, a sparse USD invoice, and an invoice with fractional
+  quantities and a discount — and reports field-level exact-match, missing,
+  invented, and mismatched values, line-item/tax structure, and validation
+  behavior. The mock baseline is deterministic and asserted at 100%; live
+  results are recorded for review and are never auto-asserted to an accuracy
+  target. Set `EVALUATION_JSON=true` to also print the complete machine-readable
+  run.
 
 ```bash
 # Run everything offline (no paid calls):
 pnpm typecheck && pnpm lint && pnpm test && pnpm build
+
+# Evaluation harness (deterministic mock baseline offline):
+pnpm evaluate
+EVALUATION_JSON=true pnpm evaluate
 
 # Live Supabase integration (opt-in):
 RUN_LIVE_INTEGRATION_TESTS=true pnpm test -- tests/integration/rls.test.ts
@@ -286,6 +309,25 @@ RUN_LIVE_INTEGRATION_TESTS=true pnpm test -- tests/integration/rls.test.ts
 # Live Gemini smoke + evaluation (opt-in):
 RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY=... pnpm test -- tests/integration/live-gemini.test.ts tests/evaluation/extraction-accuracy.test.ts
 ```
+
+### Extraction-accuracy report (`/reports`)
+
+The authenticated, read-only report compares the immutable AI extraction
+(`extracted_data`) of approved invoices with the human-approved snapshot
+(`reviewed_data`). It shows overall, header, and line-item accuracy plus
+per-field matches, corrections, missed and cleared values, line-item structure
+changes, and the evaluated invoices.
+
+- Only fields present in the reviewed snapshot are scored, so legacy or partial
+  records never fabricate agreement or disagreement.
+- Line-item fields are compared positionally only when both versions have the
+  same row count. Invoices with added or removed rows are excluded from
+  line-item accuracy and reported separately.
+- Text matches ignore case and whitespace, money and quantities compare as exact
+  decimals, currencies ignore case, and dates must match exactly.
+- The report reads at most the 500 most recent approved invoices for the
+  signed-in user. It never modifies invoices, review decisions, audit events, or
+  extraction data, and both RLS and an explicit `user_id` filter constrain it.
 
 ### Model compatibility
 
@@ -314,6 +356,10 @@ supported model — the code does not silently pick another model.
 - Only PDF, JPEG, and PNG are accepted; PDF page limit is configurable.
 - Gemini extraction quality depends on the model; validation never trusts model
   confidence scores.
+- The accuracy report scores only fields present in `reviewed_data`, compares
+  line items positionally only when both versions contain the same number of
+  rows, and covers at most the 500 most recent approved invoices. It measures
+  agreement with human review — it is not a substitute for a labelled benchmark.
 - Use `AI_PROVIDER=mock` or the synthetic fixture (`fixtures/samples/`) for
   reproducible demos. No real invoices are committed to this repository.
 
@@ -352,5 +398,5 @@ and returns as soon as Inngest accepts the event. Uploads remain bounded by the
 - Phase 1 — authentication + dashboard shell (done).
 - Phase 2 — upload, processing pipeline, validation, review (done).
 - Phase 3 — search, settings, better line-item editing (done).
-- Phase 4 — deeper AI evaluation and extraction-accuracy reporting.
+- Phase 4 — deeper AI evaluation and extraction-accuracy reporting (done).
 - Phase 5 — optional n8n webhook integration (disabled by default).

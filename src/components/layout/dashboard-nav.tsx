@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, FileUp, FileText, Settings, BarChart3 } from "lucide-react";
+import { LayoutDashboard, FileUp, FileText, Settings, BarChart3, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/upload", label: "Upload", icon: FileUp },
   { href: "/invoices", label: "Invoices", icon: FileText },
+  { href: "/reports", label: "Reports", icon: BarChart3 },
 ];
 
 const SETTINGS = { label: "Settings", href: "/settings", icon: Settings };
@@ -58,7 +59,7 @@ export function DashboardNav() {
         {SETTINGS.label}
       </Link>
       <div className="mt-6 flex items-start gap-2 rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">
-        <BarChart3 className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+        <Info className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
         <span>
           Upload your first invoice to begin the extraction and review workflow.
         </span>
